@@ -1,0 +1,6 @@
+{
+  "schema_version": 3,
+  "enabled": false,
+  "interval_sec": 100,
+  "profiles": []
+}

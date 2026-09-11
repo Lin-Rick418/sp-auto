@@ -1,0 +1,11 @@
+{
+  "mode": 2,
+  "boss_name": "Lady Fey",
+  "boss_summon_item_name": "Sunborn Petal Tuft",
+  "boss_spawn_timeout_sec": 10.0,
+  "boss_death_confirm_sec": 1.0,
+  "boss_loot_settle_sec": 3.0,
+  "boss_use_key_release_settle_sec": 0.25,
+  "lock_mouse_to_monster": true,
+  "left_click_after_mouse_lock": false
+}

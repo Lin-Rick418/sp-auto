@@ -1,0 +1,186 @@
+{
+  "schema_version": 3,
+  "enabled": true,
+  "interval_sec": 100,
+  "profiles": [
+    {
+      "item_id": "ArcaneFeet",
+      "display_name": "Arcane Boots",
+      "minimum_matches": 1,
+      "always_dismantle": false,
+      "rules": []
+    },
+    {
+      "item_id": "Codex Umbra",
+      "display_name": "Codex Umbra",
+      "minimum_matches": 1,
+      "always_dismantle": false,
+      "rules": [
+        {
+          "stat_type": "Str",
+          "minimum": 100.0
+        }
+      ]
+    },
+    {
+      "item_id": "Codex Vitae",
+      "display_name": "Codex Vitae",
+      "minimum_matches": 1,
+      "always_dismantle": false,
+      "rules": [
+        {
+          "stat_type": "Str",
+          "minimum": 100.0
+        }
+      ]
+    },
+    {
+      "item_id": "Holy Shield",
+      "display_name": "Holy Crest",
+      "minimum_matches": 1,
+      "always_dismantle": true,
+      "rules": []
+    },
+    {
+      "item_id": "Iron Ankh",
+      "display_name": "Iron Ankh",
+      "minimum_matches": 1,
+      "always_dismantle": false,
+      "rules": [
+        {
+          "stat_type": "Str",
+          "minimum": 3.0
+        },
+        {
+          "stat_type": "Vit",
+          "minimum": 3.0
+        },
+        {
+          "stat_type": "Agi",
+          "minimum": 3.0
+        },
+        {
+          "stat_type": "Dex",
+          "minimum": 3.0
+        },
+        {
+          "stat_type": "Int",
+          "minimum": 3.0
+        },
+        {
+          "stat_type": "Luk",
+          "minimum": 3.0
+        }
+      ]
+    },
+    {
+      "item_id": "SanctifiedChest",
+      "display_name": "Sanctified Chest",
+      "minimum_matches": 1,
+      "always_dismantle": true,
+      "rules": []
+    },
+    {
+      "item_id": "SanctifiedFeet",
+      "display_name": "Sanctified Shoes",
+      "minimum_matches": 2,
+      "always_dismantle": true,
+      "rules": [
+        {
+          "stat_type": "Vit",
+          "minimum": 3.0
+        },
+        {
+          "stat_type": "MoveSpd",
+          "minimum": 10.0
+        }
+      ]
+    },
+    {
+      "item_id": "SanctifiedLegs",
+      "display_name": "Sanctified Legs",
+      "minimum_matches": 1,
+      "always_dismantle": true,
+      "rules": []
+    },
+    {
+      "item_id": "SoulbinderChest",
+      "display_name": "Soulbinder Chest",
+      "minimum_matches": 3,
+      "always_dismantle": true,
+      "rules": [
+        {
+          "stat_type": "Int",
+          "minimum": 2.0
+        },
+        {
+          "stat_type": "DamageFromMagic",
+          "minimum": 3.0
+        },
+        {
+          "stat_type": "HpMult",
+          "minimum": 7.0
+        },
+        {
+          "stat_type": "MdefMult",
+          "minimum": 3.0
+        }
+      ]
+    },
+    {
+      "item_id": "SoulbinderFeet",
+      "display_name": "Soulbinder Shoes",
+      "minimum_matches": 3,
+      "always_dismantle": false,
+      "rules": [
+        {
+          "stat_type": "Int",
+          "minimum": 3.0
+        },
+        {
+          "stat_type": "AtkSpdMult",
+          "minimum": 7.0
+        },
+        {
+          "stat_type": "MoveSpdMult",
+          "minimum": 7.0
+        },
+        {
+          "stat_type": "AtkSpdLimit",
+          "minimum": 1.0
+        }
+      ]
+    },
+    {
+      "item_id": "SoulbinderLegs",
+      "display_name": "Soulbinder Legs",
+      "minimum_matches": 3,
+      "always_dismantle": true,
+      "rules": [
+        {
+          "stat_type": "Int",
+          "minimum": 3.0
+        },
+        {
+          "stat_type": "MpRegenMult",
+          "minimum": 17.0
+        },
+        {
+          "stat_type": "MpCost",
+          "minimum": 7.0
+        },
+        {
+          "stat_type": "CastSpdMult",
+          "minimum": 7.0
+        }
+      ]
+    },
+    {
+      "item_id": "Warborn Aegis",
+      "display_name": "Warborn Aegis",
+      "minimum_matches": 1,
+      "always_dismantle": true,
+      "rules": []
+    }
+  ]
+}

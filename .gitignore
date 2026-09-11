@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Release build output (versioned copies under dist/)
+dist/
+
+# Runtime logs
+*.log
+*.stdout.log
+*.stderr.log
+*.err
+
+# Process / lock / pid files
+*.lock
+.bot_test_pid
+
+# Runtime-generated IPC / state / cache JSON
+spiritvale_auction_request.json
+spiritvale_auction_results.json
+spiritvale_inventory_request.json
+spiritvale_inventory_equips.json
+spiritvale_inventory_price_report.json
+spiritvale_memory_state.json
+spiritvale_navigation_request.json
+
+# Dev preview screenshots
+*_preview.png
