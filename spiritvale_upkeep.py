@@ -6,7 +6,7 @@ from typing import Callable
 import random
 from spiritvale_config import (
     BotConfig,
-    F8_SHIFT_KEYS_BY_JOB_TYPE,
+    NAVIGATION_ATTACK_KEYS_BY_JOB_TYPE,
     NAVIGATION_UPKEEP_JOB_TYPES,
     SUMMONER_BUFF_IDS,
     SUMMONER_CHECK_ORDER,
@@ -303,20 +303,25 @@ def summoner_check_wait_status(state: SummonerCheckState) -> str:
     return f"SUMMONER CHECK {phase}{item}{error}"
 
 
-def f8_shift_keys(config: BotConfig) -> tuple[str, ...]:
-    """Return continuously held F8 modifiers selected by the configured job type."""
+def navigation_attack_keys(config: BotConfig) -> tuple[str, ...]:
+    """Return held attack keys for navigation; priest attacks use separate taps."""
     try:
-        return F8_SHIFT_KEYS_BY_JOB_TYPE[config.job_type]
+        return NAVIGATION_ATTACK_KEYS_BY_JOB_TYPE[config.job_type]
     except KeyError as error:
         raise ValueError(
             "job_type must be 0 (under level 64), 1 (summoner), or 2 (priest)"
         ) from error
 
 
-def next_priest_shift_tap_at(now: float, config: BotConfig) -> float:
-    """Schedule the next priest Left Shift tap using the configured random range."""
+def next_priest_attack_at(now: float, config: BotConfig) -> float:
+    """Schedule the next priest Left Shift attack using the configured interval."""
     interval_ms = random.uniform(
         config.priest_left_shift_tap_min_interval_ms,
         config.priest_left_shift_tap_max_interval_ms,
     )
     return now + interval_ms / 1000
+
+
+# Preserve imports used by older diagnostics; runtime code uses attack semantics.
+f8_shift_keys = navigation_attack_keys
+next_priest_shift_tap_at = next_priest_attack_at

@@ -39,6 +39,7 @@ from spiritvale_paths import IPC_DIR, request_probe_load
 
 # Re-export the established API for existing launchers and diagnostics.
 from spiritvale_config import (
+    ATTACK_KEYS,
     BotConfig,
     ModeConfig,
     default_summoner_checks,
@@ -153,6 +154,8 @@ from spiritvale_loot import (
     track_memory_loot_candidate,
 )
 from spiritvale_upkeep import (
+    navigation_attack_keys,
+    next_priest_attack_at,
     summon_mount_blocks_navigation,
     reset_summon_mount_key_state,
     advance_summon_mount_hotkeys,
@@ -1068,14 +1071,15 @@ def update_held_keys(
     held: set[str],
     desired: Iterable[str],
 ) -> set[str]:
+    """Update held inputs; attack keys are delivered by the probe through IPC."""
     desired_set = set(desired)
     releases, presses = key_transitions(held, desired_set)
     for key in releases:
-        if key in HELD_SHIFT_KEYS:
+        if key in ATTACK_KEYS:
             continue
         post_key(hwnd, key, False)
     for key in presses:
-        if key in HELD_SHIFT_KEYS:
+        if key in ATTACK_KEYS:
             continue
         post_key(hwnd, key, True)
     return desired_set
@@ -1452,6 +1456,7 @@ def run_bot(
         flush=True,
     )
     print(f"模式：{'背景 WASD' if send_input else '預覽（不送按鍵）'}", flush=True)
+    print("攻擊鍵：Left Shift、Right Shift；移動鍵：W、A、S、D。", flush=True)
     print(
         f"移動模式：{mode} {MODE_NAMES[mode]}"
         + (
@@ -1550,7 +1555,7 @@ def run_bot(
     active = not config.start_paused
     input_allowed = False
     held_keys: set[str] = set()
-    tapped_shift_keys: set[str] = set()
+    tapped_attack_keys: set[str] = set()
     snapshot: MemorySnapshot | None = None
     target: MemoryMonster | None = None
     follow_mode = False
@@ -1606,7 +1611,7 @@ def run_bot(
     navigation_earnings = NavigationEarningsState()
     boss_farm = BossFarmState()
     mouse_click_completed_for_target = False
-    priest_shift_next_tap_at = -math.inf
+    priest_attack_due_at = -math.inf
     if send_input and active:
         start_navigation_earnings(
             navigation_earnings, now=time.monotonic(), tracking=True
@@ -1630,13 +1635,13 @@ def run_bot(
         nonlocal pending_summon_action, pending_loot_interact
         if not send_input or not input_allowed:
             return False
-        if key in HELD_SHIFT_KEYS:
-            tapped_shift_keys.add(key)
+        if key in ATTACK_KEYS:
+            tapped_attack_keys.add(key)
             publish_navigation_intent(requested_target_id, requested_target_kind)
             try:
                 time.sleep(max(0.0, hold_ms / 1000))
             finally:
-                tapped_shift_keys.discard(key)
+                tapped_attack_keys.discard(key)
                 publish_navigation_intent(requested_target_id, requested_target_kind)
             return True
         summon_action = ""
@@ -1714,10 +1719,10 @@ def run_bot(
         movement_keys = tuple(
             key for key in ("w", "a", "s", "d") if key in held_keys
         )
-        shift_keys = tuple(
+        attack_keys = tuple(
             key
-            for key in HELD_SHIFT_KEYS
-            if key in held_keys or key in tapped_shift_keys
+            for key in ATTACK_KEYS
+            if key in held_keys or key in tapped_attack_keys
         )
         focus_target_object_id = 0
         focus_target_world = (0.0, 0.0, 0.0)
@@ -1744,7 +1749,7 @@ def run_bot(
             movement_world=movement_world_for_keys(
                 movement_keys, snapshot.player if snapshot is not None else None
             ),
-            shift_keys=shift_keys,
+            shift_keys=attack_keys,
             focus_target_object_id=focus_target_object_id,
             focus_target_world=focus_target_world,
             background_input_mode=os.environ.get(
@@ -2773,7 +2778,7 @@ def run_bot(
                     else ()
                 )
                 desired_follow_keys = (
-                    (*movement_keys, *HELD_SHIFT_KEYS) if path_ready else ()
+                    (*movement_keys, *ATTACK_KEYS) if path_ready else ()
                 )
                 if path_ready:
                     status = (
@@ -3255,7 +3260,7 @@ def run_bot(
                     ):
                         desired_loot_keys = (
                             *desired_loot_keys,
-                            *f8_shift_keys(config),
+                            *navigation_attack_keys(config),
                         )
                     set_keys(desired_loot_keys)
                     if config.debug_window:
@@ -3510,7 +3515,7 @@ def run_bot(
             publish_navigation_intent(target.object_id)
             if target.object_id != previous_target_id:
                 mouse_click_completed_for_target = False
-                priest_shift_next_tap_at = -math.inf
+                priest_attack_due_at = -math.inf
                 chase_started_at = now
                 path_invalid_since = None
                 progress_anchor = snapshot.player.position
@@ -3600,14 +3605,14 @@ def run_bot(
                 if (
                     config.job_type == 2
                     and player_map_exit is None
-                    and now >= priest_shift_next_tap_at
+                    and now >= priest_attack_due_at
                 ):
                     if not mouse_moved:
                         mouse_moved = move_mouse_to_monster(hwnd, target)
                     if mouse_moved and tap_game_key(
                         "lshift", config.priest_left_shift_tap_hold_ms
                     ):
-                        priest_shift_next_tap_at = next_priest_shift_tap_at(
+                        priest_attack_due_at = next_priest_attack_at(
                             now, config
                         )
 
@@ -3640,7 +3645,7 @@ def run_bot(
                 target = None
                 reset_combat_watchdog(combat_watchdog, None, now)
                 publish_navigation_intent(0)
-                handoff_keys = f8_shift_keys(config)
+                handoff_keys = navigation_attack_keys(config)
                 set_keys(handoff_keys)
                 if config.debug_window:
                     cv2.imshow(
@@ -3910,7 +3915,7 @@ def run_bot(
                 and (safe_path or arrived)
                 and player_map_exit is None
             ):
-                desired_keys = (*desired_keys, *f8_shift_keys(config))
+                desired_keys = (*desired_keys, *navigation_attack_keys(config))
             set_keys(desired_keys)
             if config.debug_window:
                 cv2.imshow(

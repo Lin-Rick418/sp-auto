@@ -21,7 +21,10 @@ VK_BY_KEY = {
 }
 
 
-HELD_SHIFT_KEYS = ("lshift", "rshift")
+# Fixed game attack bindings. These are attacks, not movement modifiers.
+ATTACK_KEYS = ("lshift", "rshift")
+# Compatibility for existing diagnostics and imports.
+HELD_SHIFT_KEYS = ATTACK_KEYS
 
 
 JOB_TYPE_LABELS = {
@@ -31,11 +34,12 @@ JOB_TYPE_LABELS = {
 }
 
 
-F8_SHIFT_KEYS_BY_JOB_TYPE = {
+NAVIGATION_ATTACK_KEYS_BY_JOB_TYPE = {
     0: ("lshift",),
-    1: HELD_SHIFT_KEYS,
+    1: ATTACK_KEYS,
     2: (),
 }
+F8_SHIFT_KEYS_BY_JOB_TYPE = NAVIGATION_ATTACK_KEYS_BY_JOB_TYPE
 
 
 # These jobs must finish summon/buff and mount upkeep before navigation inputs.

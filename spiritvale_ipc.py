@@ -13,7 +13,7 @@ import os
 import threading
 import time
 from spiritvale_config import (
-    HELD_SHIFT_KEYS,
+    ATTACK_KEYS,
     NUMPAD_SKILL_KEYS,
 )
 from spiritvale_models import (
@@ -357,7 +357,8 @@ def write_navigation_request(
         ),
         "movement_world": list(normalized_movement_world),
         "shift_keys": ",".join(
-            key for key in HELD_SHIFT_KEYS if key in shift_key_set
+            # Keep the wire name for compatibility with the installed probe DLL.
+            key for key in ATTACK_KEYS if key in shift_key_set
         ),
         "summon_action": (
             str(summon_action).strip().casefold()
