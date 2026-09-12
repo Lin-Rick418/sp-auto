@@ -2,8 +2,8 @@
 
 The BepInEx probe exposes the local player, hostile monsters, dropped loot,
 camera axes and a Unity NavMesh path through versioned JSON files. This process
-follows world-space waypoints with background WASD messages and presses V near
-eligible loot. It never captures the game image.
+follows world-space waypoints with background WASD and requests targeted
+interaction with eligible loot. It never captures the game image.
 
 Use only where the game's rules permit automation.
 """
@@ -12,17 +12,13 @@ from __future__ import annotations
 
 import argparse
 import ctypes
-from ctypes import wintypes
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass
 from functools import lru_cache
 import json
 import math
-import msvcrt
 import os
-import re
 from pathlib import Path
 import queue
-import random
 import sys
 import threading
 import time
@@ -41,107 +37,155 @@ import spiritvale_inventory_pricer as inventory_pricer
 from spiritvale_paths import IPC_DIR, request_probe_load
 
 
+# Re-export the established API for existing launchers and diagnostics.
+from spiritvale_config import (
+    BotConfig,
+    ModeConfig,
+    default_summoner_checks,
+    load_config,
+    normalize_summoner_checks,
+    load_mode_config,
+    save_config,
+    VK_BY_KEY,
+    HELD_SHIFT_KEYS,
+    JOB_TYPE_LABELS,
+    F8_SHIFT_KEYS_BY_JOB_TYPE,
+    NAVIGATION_UPKEEP_JOB_TYPES,
+    SUMMONER_CHECK_ORDER,
+    SUMMONER_SUMMON_IDS,
+    SUMMONER_BUFF_IDS,
+    SUMMONER_TARGET_SUMMON_IDS,
+    SUMMONER_CHECK_LABELS,
+    NUMPAD_SKILL_KEYS,
+    MODE_NAMES,
+)
+from spiritvale_models import (
+    MemoryPlayer,
+    MemoryObservedPlayer,
+    MemoryPartyMember,
+    MemoryMonster,
+    MemoryLoot,
+    MemoryMapExit,
+    MemoryPath,
+    MemoryConsumableUse,
+    MemorySnapshot,
+    CombatWatchdogState,
+    LootChaseState,
+    SummonMountKeyState,
+    SummonerCheckState,
+    NavigationEarningsState,
+    NavigationEarningsReport,
+    BossFarmState,
+    SnapshotUnavailable,
+)
+from spiritvale_snapshot import (
+    MEMORY_SCHEMA_VERSION,
+    _finite_float,
+    _vector3,
+    _vector2,
+    parse_memory_snapshot,
+    no_enemy_status,
+    snapshot_error_log_key,
+)
+from spiritvale_ipc import (
+    NavigationRequestPublisher,
+    IPC_READ_ATTEMPTS,
+    IPC_WRITE_ATTEMPTS,
+    IPC_RETRY_DELAY_SEC,
+    load_memory_snapshot,
+    wait_for_wallet_snapshot,
+    wait_for_party_snapshot,
+    _read_windows_shared_text,
+    atomic_write_json,
+    write_navigation_request,
+)
+from spiritvale_navigation import (
+    horizontal_distance,
+    parse_monster_level,
+    detect_boss_object_id,
+    normalize_boss_name,
+    monster_matches_boss,
+    select_boss_farm_target,
+    should_advance_train_target,
+    select_memory_target,
+    find_follow_player_by_name,
+    find_follow_party_member_by_name,
+    find_follow_party_member,
+    find_local_party_member,
+    party_channel_number,
+    party_member_needs_channel_switch,
+    find_follow_player,
+    follow_stop_distance_world,
+    update_follow_rejoin_state,
+    select_follow_memory_target,
+    reset_combat_watchdog,
+    pause_combat_watchdog,
+    update_combat_watchdog,
+    combat_reengage_keys,
+    finish_combat_reengage,
+    refresh_combat_blacklist,
+    request_path_matches,
+    select_path_waypoint,
+    _normalize2,
+    movement_world_for_keys,
+    movement_keys_for_world_waypoint,
+    arrival_radius,
+    map_exit_avoidance_radius,
+    point_inside_map_exit_keepout,
+    _horizontal_segment_distance,
+    path_enters_map_exit_keepout,
+    unstuck_keys,
+)
+from spiritvale_loot import (
+    plan_loot_interaction,
+    plan_loot_approach,
+    LOOT_RARITY_VALUES,
+    loot_is_equipment,
+    select_boss_legendary_loot,
+    loot_minimum_rarity_value,
+    loot_ownership_label,
+    select_memory_loot,
+    loot_pickup_radius,
+    loot_is_within_pickup_range,
+    loot_pickup_hold_radius,
+    reset_loot_chase,
+    loot_chase_failure_reason,
+    track_memory_loot_candidate,
+)
+from spiritvale_upkeep import (
+    summon_mount_blocks_navigation,
+    reset_summon_mount_key_state,
+    advance_summon_mount_hotkeys,
+    summon_mount_wait_status,
+    reset_summoner_check_state,
+    summoner_checks_enabled,
+    missing_summoner_checks,
+    advance_summoner_checks,
+    summoner_check_wait_status,
+    f8_shift_keys,
+    next_priest_shift_tap_at,
+)
+from spiritvale_earnings import (
+    start_navigation_earnings,
+    pause_navigation_earnings,
+    resume_navigation_earnings,
+    mark_navigation_earnings_incomplete,
+    observe_navigation_wallet,
+    finish_navigation_earnings,
+    format_navigation_earnings_report,
+)
+
+
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "spiritvale_bot_config.json"
 MODE_CONFIG_PATH = BASE_DIR / "spiritvale_mode_config.json"
 MEMORY_STATE_PATH = IPC_DIR / "spiritvale_memory_state.json"
 NAVIGATION_REQUEST_PATH = IPC_DIR / "spiritvale_navigation_request.json"
-MEMORY_SCHEMA_VERSION = 1
 RADAR_WINDOW_NAME = "SpiritVale Navigator - Memory / NavMesh"
 PRICE_WINDOW_NAME = "SpiritVale Backpack Prices"
 PRICE_WINDOW_WIDTH = 760
 PRICE_WINDOW_HEIGHT = 760
-IPC_READ_ATTEMPTS = 5
-IPC_WRITE_ATTEMPTS = 5
-IPC_RETRY_DELAY_SEC = 0.002
 FOLLOW_CHANNEL_RETRY_SEC = 5.0
-
-VK_BY_KEY = {
-    "0": ord("0"),
-    "9": ord("9"),
-    "w": ord("W"),
-    "a": ord("A"),
-    "s": ord("S"),
-    "d": ord("D"),
-    "v": ord("V"),
-    "lshift": win32con.VK_LSHIFT,
-    "rshift": win32con.VK_RSHIFT,
-}
-HELD_SHIFT_KEYS = ("lshift", "rshift")
-JOB_TYPE_LABELS = {
-    0: "未滿 64 等",
-    1: "召喚",
-    2: "牧師",
-}
-F8_SHIFT_KEYS_BY_JOB_TYPE = {
-    0: ("lshift",),
-    1: HELD_SHIFT_KEYS,
-    2: (),
-}
-# Job types that must finish their class upkeep — every selected summon/buff and
-# any summon-mount step — before ANY navigation input is emitted, including the
-# continuously held Left/Right Shift keys. The main loop releases all keys and
-# skips navigation while these checks are outstanding, and only resumes once a
-# later snapshot confirms everything is present. Only the summoner (1) needs this
-# today; add a future class's job_type here to reuse the same
-# "cast everything first, then navigate" gate with no other code changes.
-NAVIGATION_UPKEEP_JOB_TYPES = frozenset({1})
-SUMMONER_CHECK_ORDER = (
-    "SummonSkeleton",
-    "SummonAbomination",
-    "SummonSkeletonMage",
-    "Invoker",
-    "Conjurer",
-    "DeathBramble",
-    "GuardianBond",
-)
-SUMMONER_SUMMON_IDS = frozenset(SUMMONER_CHECK_ORDER[:3])
-SUMMONER_BUFF_IDS = frozenset(SUMMONER_CHECK_ORDER[3:])
-# Buffs that must be cast on one of the player's own summons: the recast has to
-# carry the summon in the input DTO's UnitId (FastCast), not a bare NumPad press.
-# The probe resolves the actual summon; here we only flag that targeting is needed.
-SUMMONER_TARGET_SUMMON_IDS = frozenset({"GuardianBond"})
-SUMMONER_CHECK_LABELS = {
-    "SummonSkeleton": "Summon Skeleton",
-    "SummonAbomination": "Summon Abomination",
-    "SummonSkeletonMage": "Summon Skeleton Mage",
-    "Invoker": "Invoker",
-    "Conjurer": "Conjurer",
-    "DeathBramble": "Necrotic Presence",
-    "GuardianBond": "Guardian Bond",
-}
-NUMPAD_SKILL_KEYS = tuple(f"numpad{number}" for number in range(10))
-
-
-def default_summoner_checks() -> dict[str, dict[str, object]]:
-    return {
-        check_id: {"enabled": False, "key": ""}
-        for check_id in SUMMONER_CHECK_ORDER
-    }
-
-_CREATE_FILE = ctypes.windll.kernel32.CreateFileW
-_CREATE_FILE.argtypes = (
-    wintypes.LPCWSTR,
-    wintypes.DWORD,
-    wintypes.DWORD,
-    wintypes.LPVOID,
-    wintypes.DWORD,
-    wintypes.DWORD,
-    wintypes.HANDLE,
-)
-_CREATE_FILE.restype = wintypes.HANDLE
-_CLOSE_HANDLE = ctypes.windll.kernel32.CloseHandle
-_CLOSE_HANDLE.argtypes = (wintypes.HANDLE,)
-_CLOSE_HANDLE.restype = wintypes.BOOL
-
-_GENERIC_READ = 0x80000000
-_FILE_SHARE_READ = 0x00000001
-_FILE_SHARE_WRITE = 0x00000002
-_FILE_SHARE_DELETE = 0x00000004
-_OPEN_EXISTING = 3
-_FILE_ATTRIBUTE_NORMAL = 0x00000080
-_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
-
 
 def control_menu_hotkey_down(hwnd: int) -> bool:
     """Read the single control hotkey (F8) that opens the consolidated menu.
@@ -163,337 +207,6 @@ def control_menu_hotkey_down(hwnd: int) -> bool:
         return win32gui.GetForegroundWindow() == hwnd
     except Exception:
         return False
-
-
-@dataclass
-class BotConfig:
-    window_title: str = "SpiritVale"
-    loop_delay_ms: int = 25
-    target_lost_wait_ms: int = 100
-    memory_snapshot_timeout_ms: int = 750
-    axis_deadzone_ratio: float = 0.28
-    arrival_padding_world: float = 0.75
-    map_exit_avoidance_padding_world: float = 3.0
-    path_waypoint_tolerance_world: float = 0.35
-    target_max_chase_sec: float = 8.0
-    target_skip_cooldown_sec: float = 15.0
-    path_invalid_grace_sec: float = 1.0
-    combat_health_progress_epsilon: float = 0.001
-    combat_no_progress_sec: float = 6.0
-    combat_reengage_back_ms: int = 450
-    combat_reengage_side_ms: int = 650
-    combat_blacklist_absence_reset_sec: float = 5.0
-    stuck_timeout_sec: float = 1.6
-    stuck_position_epsilon_world: float = 0.2
-    unstuck_back_ms: int = 450
-    unstuck_back_diagonal_ms: int = 550
-    unstuck_side_ms: int = 500
-    unstuck_diagonal_ms: int = 700
-    unstuck_return_ms: int = 550
-    unstuck_forward_ms: int = 350
-    unstuck_min_success_world: float = 0.8
-    unstuck_max_attempts: int = 2
-    memory_loot_min_rarity: str = "Legendary"
-    memory_loot_range_padding_world: float = 0.75
-    # Once pickup preparation starts, tolerate small position jitter up to the
-    # loot's real interaction radius instead of restarting the release timer.
-    memory_loot_pickup_hysteresis_world: float = 0.25
-    memory_loot_max_distance_world: float = 3.0
-    memory_loot_confirm_frames: int = 2
-    # Keep every movement/Shift key released long enough for the probe to
-    # observe a neutral request before sending the targeted loot click.
-    memory_loot_release_settle_ms: int = 50
-    memory_loot_interact_cooldown_ms: int = 500
-    memory_loot_clear_confirm_frames: int = 5
-    memory_loot_chase_timeout_sec: float = 20.0
-    memory_loot_retry_cooldown_sec: float = 15.0
-    auto_relogin_enabled: bool = True
-    auto_relogin_disconnect_grace_sec: float = 3.0
-    auto_relogin_builtin_wait_max_sec: float = 30.0
-    auto_relogin_attempt_timeout_sec: float = 30.0
-    auto_relogin_retry_delay_sec: float = 10.0
-    auto_relogin_max_attempts: int = 5
-    debug_window: bool = False
-    # When true the bot launches idle (navigation off); open the F8 menu and
-    # pick 一般導航 to start. Default false keeps the classic --run behavior of
-    # starting to navigate immediately.
-    start_paused: bool = False
-    radar_size_px: int = 660
-    pricing_enabled: bool = True
-    pricing_auto_start: bool = False
-    pricing_window_enabled: bool = True
-    pricing_high_value_threshold: int = 50_000
-    pricing_page_rows: int = 8
-    pricing_timeout_sec: float = 25.0
-    pricing_request_delay_sec: float = 0.2
-    follow_player_enabled: bool = True
-    follow_monster_radius_world: float = 50.0
-    # Boss avoidance: the map boss is detected as the strictly-highest-level,
-    # unique living enemy. When avoid_boss is true the bot never targets it.
-    # boss_response picks what else it does: "switch_channel" hops to the next
-    # channel (current+1, wrapping) so the fresh instance is boss-free;
-    # "flee" instead walks away whenever the boss comes within
-    # boss_flee_radius_world. switch_channel falls back to flee for any frame
-    # where channel data is not yet known.
-    avoid_boss: bool = False
-    boss_response: str = "switch_channel"
-    boss_flee_radius_world: float = 15.0
-    boss_channel_switch_settle_sec: float = 6.0
-    follow_player_stop_padding_world: float = 2.0
-    follow_player_rejoin_distance_world: float = 10.0
-    _comment_job_type: str = (
-        "0=未滿64等；1=召喚；2=牧師（一般導航每 300-1300ms 短按 Left Shift）"
-    )
-    job_type: int = 1
-    priest_left_shift_tap_hold_ms: int = 50
-    priest_left_shift_tap_min_interval_ms: int = 300
-    priest_left_shift_tap_max_interval_ms: int = 1300
-    summon_reanimation_key: str = "9"
-    summon_mount_key: str = "0"
-    summon_skill_key_hold_ms: int = 50
-    summon_reanimation_delay_ms: int = 750
-    summon_mount_confirm_timeout_ms: int = 4000
-    summon_mount_key_retry_delay_ms: int = 400
-    summon_mount_retry_delay_ms: int = 2500
-    summoner_checks: dict[str, dict[str, object]] = field(
-        default_factory=default_summoner_checks
-    )
-    summoner_check_settle_ms: int = 500
-    summoner_check_retry_delay_ms: int = 800
-
-
-@dataclass(frozen=True)
-class ModeConfig:
-    mode: int = 1
-    boss_name: str = ""
-    boss_summon_item_name: str = ""
-    boss_spawn_timeout_sec: float = 10.0
-    boss_death_confirm_sec: float = 1.0
-    boss_loot_settle_sec: float = 3.0
-    boss_use_key_release_settle_sec: float = 0.25
-    lock_mouse_to_monster: bool = False
-    left_click_after_mouse_lock: bool = False
-
-
-@dataclass(frozen=True)
-class MemoryPlayer:
-    position: tuple[float, float, float]
-    camera_forward_xz: tuple[float, float]
-    camera_right_xz: tuple[float, float]
-    collider_radius: float
-    is_mounted_summon: bool = False
-    is_mountable_summon: bool = False
-    active_summon_count: int = 0
-    has_primary_summon: bool = False
-    summon_id: str = ""
-    mounted_summon_state_available: bool = False
-    summon_mount_action_available: bool = False
-    summon_displays_available: bool = False
-    summon_displays_error: str = ""
-    summon_display_skill_ids: tuple[str, ...] = ()
-    active_statuses_available: bool = False
-    active_statuses_error: str = ""
-    active_status_ids: tuple[str, ...] = ()
-    guardian_bond_available: bool = False
-    guardian_bond_error: str = ""
-    guardian_bond_active: bool = False
-    guardian_bond_candidate_id: int = 0
-    guardian_bond_cast_error: str = ""
-    wallet_coins: int = 0
-    wallet_coins_available: bool = False
-    wallet_coins_error: str = ""
-    alive: bool = True
-
-
-@dataclass(frozen=True)
-class MemoryObservedPlayer:
-    object_id: int
-    player_id: str
-    display_name: str
-    position: tuple[float, float, float]
-    collider_radius: float
-    alive: bool
-    visible: bool
-    party_member: bool
-    selected: bool
-
-
-@dataclass(frozen=True)
-class MemoryPartyMember:
-    display_name: str
-    player_id: str
-    object_id: int
-    map_id: int
-    instance_id: str
-    channel_index: int
-    is_local: bool
-
-
-@dataclass(frozen=True)
-class MemoryMonster:
-    object_id: int
-    config_id: str
-    display_name: str
-    rank: str
-    position: tuple[float, float, float]
-    health_ratio: float
-    collider_radius: float
-    team: str = "enemy"
-    alive: bool = True
-    visible: bool = True
-    training_dummy: bool = False
-    viewport_position: tuple[float, float, float] | None = None
-    viewport_visible: bool = False
-    # Numeric level parsed from display_name ("Lv.40" -> 40); 0 when absent.
-    level: int = 0
-    # True only for the detected boss while avoid_boss is enabled: the bot must
-    # keep away from it. False means the monster is a normal, attackable target.
-    avoid: bool = False
-
-
-@dataclass(frozen=True)
-class MemoryLoot:
-    object_id: int
-    item_id: str
-    display_name: str
-    sprite_id: str
-    rarity: str
-    rarity_value: int
-    loot_type: str
-    position: tuple[float, float, float]
-    viewport_position: tuple[float, float, float]
-    viewport_visible: bool
-    locked: bool
-    owner_player_id: str
-    owner_party_id: int
-    owned_by_local_player: bool
-    interaction_range: float
-
-
-@dataclass(frozen=True)
-class MemoryMapExit:
-    position: tuple[float, float, float]
-    interaction_range: float
-
-
-@dataclass(frozen=True)
-class MemoryPath:
-    request_id: int
-    target_object_id: int
-    status: str
-    corners: tuple[tuple[float, float, float], ...]
-    target_kind: str = "monster"
-
-
-@dataclass(frozen=True)
-class MemoryConsumableUse:
-    request_id: int = 0
-    status: str = "idle"
-    item_id: str = ""
-    display_name: str = ""
-    remaining_count: int = -1
-    error: str = ""
-
-
-@dataclass(frozen=True)
-class MemorySnapshot:
-    timestamp_ms: int
-    map_id: int
-    instance_id: int
-    player: MemoryPlayer
-    monsters: tuple[MemoryMonster, ...]
-    path: MemoryPath
-    channel_index: int = -1
-    channel_count: int = 0
-    players: tuple[MemoryObservedPlayer, ...] = ()
-    party_members: tuple[MemoryPartyMember, ...] = ()
-    party_state_available: bool = False
-    loots: tuple[MemoryLoot, ...] = ()
-    map_exits: tuple[MemoryMapExit, ...] = ()
-    map_exit_state_available: bool = True
-    player_scan: dict[str, object] | None = None
-    monster_scan: dict[str, object] | None = None
-    loot_scan: dict[str, object] | None = None
-    consumable_use: MemoryConsumableUse = MemoryConsumableUse()
-
-
-@dataclass
-class CombatWatchdogState:
-    target_object_id: int | None = None
-    best_health_ratio: float = 1.0
-    last_progress_at: float = 0.0
-    was_in_range: bool = False
-    reengage_attempted: bool = False
-    reposition_started_at: float | None = None
-
-
-@dataclass
-class LootChaseState:
-    target_object_id: int | None = None
-    started_at: float = 0.0
-    path_invalid_since: float | None = None
-    progress_anchor: tuple[float, float, float] | None = None
-    progress_started_at: float = 0.0
-    unstuck_started_at: float | None = None
-    unstuck_anchor: tuple[float, float, float] | None = None
-    unstuck_attempt: int = 0
-    unstuck_side: str = "a"
-    release_started_at: float | None = None
-
-
-@dataclass
-class SummonMountKeyState:
-    phase: str = "idle"
-    stage_started_at: float = 0.0
-    next_mount_retry_at: float = 0.0
-    retry_after: float = 0.0
-    error: str = ""
-
-
-@dataclass
-class SummonerCheckState:
-    phase: str = "idle"
-    item_id: str = ""
-    settle_until: float = 0.0
-    retry_after: dict[str, float] = field(default_factory=dict)
-    error: str = ""
-
-
-@dataclass
-class NavigationEarningsState:
-    session_active: bool = False
-    tracking_active: bool = False
-    segment_started_at: float = 0.0
-    elapsed_seconds: float = 0.0
-    gross_income: int = 0
-    last_wallet_coins: int | None = None
-    current_wallet_coins: int | None = None
-    last_snapshot_timestamp_ms: int = 0
-    wallet_sample_count: int = 0
-    data_incomplete: bool = False
-    final_balance_from_last_sample: bool = False
-
-
-@dataclass(frozen=True)
-class NavigationEarningsReport:
-    elapsed_seconds: float
-    gross_income: int
-    current_wallet_coins: int | None
-    wallet_sample_count: int
-    data_incomplete: bool
-    final_balance_from_last_sample: bool
-
-
-@dataclass
-class BossFarmState:
-    phase: str = "startup"
-    tracked_boss_object_id: int | None = None
-    boss_missing_since: float | None = None
-    loot_settle_until: float = 0.0
-    use_request_id: int = 0
-    use_requested_at: float = 0.0
-    key_release_started_at: float | None = None
-    fault: str = ""
 
 
 @dataclass(frozen=True)
@@ -682,10 +395,6 @@ class PricingController:
         cancel_event.set()
         if thread is not None and thread is not threading.current_thread():
             thread.join(max(0.0, join_timeout))
-
-
-def loot_is_equipment(loot: MemoryLoot) -> bool:
-    return loot.loot_type.strip().casefold() in {"equip", "equipment"}
 
 
 def pricing_radar_summary(state: PricingViewState) -> str:
@@ -887,10 +596,6 @@ def draw_pricing_window(
     return canvas, page, page_count
 
 
-class SnapshotUnavailable(RuntimeError):
-    """The probe state cannot safely drive movement."""
-
-
 def enable_dpi_awareness() -> None:
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -901,1742 +606,8 @@ def enable_dpi_awareness() -> None:
             pass
 
 
-def load_config(path: Path) -> BotConfig:
-    if not path.exists():
-        config = BotConfig()
-        save_config(path, config)
-        return config
-    raw = json.loads(path.read_text(encoding="utf-8-sig"))
-    known = BotConfig.__dataclass_fields__
-    config = BotConfig(**{key: value for key, value in raw.items() if key in known})
-    if type(config.job_type) is not int or config.job_type not in (0, 1, 2):
-        raise ValueError(
-            "job_type must be 0 (under level 64), 1 (summoner), or 2 (priest)"
-        )
-    if type(config.avoid_boss) is not bool:
-        raise ValueError("avoid_boss must be true or false")
-    if config.boss_response not in {"flee", "switch_channel"}:
-        raise ValueError("boss_response must be flee or switch_channel")
-    if config.boss_flee_radius_world < 0:
-        raise ValueError("boss_flee_radius_world must be non-negative")
-    if config.boss_channel_switch_settle_sec < 0:
-        raise ValueError("boss_channel_switch_settle_sec must be non-negative")
-    if config.summon_reanimation_key not in VK_BY_KEY:
-        raise ValueError("summon_reanimation_key is not a supported key")
-    if config.summon_mount_key not in VK_BY_KEY:
-        raise ValueError("summon_mount_key is not a supported key")
-    config.summoner_checks = normalize_summoner_checks(config.summoner_checks)
-    if min(
-        config.memory_loot_release_settle_ms,
-        config.memory_loot_interact_cooldown_ms,
-        config.priest_left_shift_tap_hold_ms,
-        config.priest_left_shift_tap_min_interval_ms,
-        config.priest_left_shift_tap_max_interval_ms,
-        config.summon_skill_key_hold_ms,
-        config.summon_reanimation_delay_ms,
-        config.summon_mount_confirm_timeout_ms,
-        config.summon_mount_key_retry_delay_ms,
-        config.summon_mount_retry_delay_ms,
-        config.summoner_check_settle_ms,
-        config.summoner_check_retry_delay_ms,
-    ) < 0:
-        raise ValueError("key timing settings must be non-negative")
-    if (
-        config.priest_left_shift_tap_min_interval_ms
-        > config.priest_left_shift_tap_max_interval_ms
-    ):
-        raise ValueError(
-            "priest Left Shift minimum interval cannot exceed maximum interval"
-        )
-    return config
 
 
-def normalize_summoner_checks(
-    value: object,
-) -> dict[str, dict[str, object]]:
-    """Return the fixed summoner check configuration (one entry per check)."""
-    if value is None:
-        value = {}
-    if not isinstance(value, dict):
-        raise ValueError("summoner_checks must be an object")
-    normalized = default_summoner_checks()
-    for check_id in SUMMONER_CHECK_ORDER:
-        raw = value.get(check_id, {})
-        if raw is None:
-            raw = {}
-        if not isinstance(raw, dict):
-            raise ValueError(f"summoner_checks.{check_id} must be an object")
-        enabled = raw.get("enabled", False)
-        if type(enabled) is not bool:
-            raise ValueError(
-                f"summoner_checks.{check_id}.enabled must be true or false"
-            )
-        key = str(raw.get("key", "") or "").strip().casefold()
-        if key and key not in NUMPAD_SKILL_KEYS:
-            raise ValueError(
-                f"summoner_checks.{check_id}.key must be numpad0 through numpad9"
-            )
-        if enabled and not key:
-            raise ValueError(
-                f"summoner_checks.{check_id} is enabled but has no NumPad key"
-            )
-        normalized[check_id] = {"enabled": enabled, "key": key}
-    return normalized
-
-
-def load_mode_config(path: Path) -> ModeConfig:
-    raw = json.loads(path.read_text(encoding="utf-8-sig"))
-    if not isinstance(raw, dict):
-        raise ValueError("mode config must be a JSON object")
-    mode = raw.get("mode")
-    if type(mode) is not int or mode not in (1, 2, 3):
-        raise ValueError("mode must be 1 (normal), 2 (train), or 3 (boss farm)")
-    boss_name = str(raw.get("boss_name", "")).strip()
-    boss_summon_item_name = str(raw.get("boss_summon_item_name", "")).strip()
-    if mode == 3 and not boss_name:
-        raise ValueError("boss_name is required for mode 3")
-    if mode == 3 and not boss_summon_item_name:
-        raise ValueError("boss_summon_item_name is required for mode 3")
-    timings: dict[str, float] = {}
-    for key, default in (
-        ("boss_spawn_timeout_sec", 10.0),
-        ("boss_death_confirm_sec", 1.0),
-        ("boss_loot_settle_sec", 3.0),
-        ("boss_use_key_release_settle_sec", 0.25),
-    ):
-        try:
-            value = float(raw.get(key, default))
-        except (TypeError, ValueError) as error:
-            raise ValueError(f"{key} must be a finite non-negative number") from error
-        if not math.isfinite(value) or value < 0:
-            raise ValueError(f"{key} must be a finite non-negative number")
-        timings[key] = value
-    lock_mouse_to_monster = raw.get("lock_mouse_to_monster", False)
-    if type(lock_mouse_to_monster) is not bool:
-        raise ValueError("lock_mouse_to_monster must be true or false")
-    left_click_after_mouse_lock = raw.get("left_click_after_mouse_lock", False)
-    if type(left_click_after_mouse_lock) is not bool:
-        raise ValueError("left_click_after_mouse_lock must be true or false")
-    return ModeConfig(
-        mode=mode,
-        boss_name=boss_name,
-        boss_summon_item_name=boss_summon_item_name,
-        boss_spawn_timeout_sec=timings["boss_spawn_timeout_sec"],
-        boss_death_confirm_sec=timings["boss_death_confirm_sec"],
-        boss_loot_settle_sec=timings["boss_loot_settle_sec"],
-        boss_use_key_release_settle_sec=timings[
-            "boss_use_key_release_settle_sec"
-        ],
-        lock_mouse_to_monster=lock_mouse_to_monster,
-        left_click_after_mouse_lock=left_click_after_mouse_lock,
-    )
-
-
-def save_config(path: Path, config: BotConfig) -> None:
-    path.write_text(
-        json.dumps(asdict(config), ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
-
-def _finite_float(value: object, field: str) -> float:
-    number = float(value)
-    if not math.isfinite(number):
-        raise SnapshotUnavailable(f"{field} is not finite")
-    return number
-
-
-def _vector3(value: object, field: str) -> tuple[float, float, float]:
-    if not isinstance(value, list) or len(value) != 3:
-        raise SnapshotUnavailable(f"{field} must be a three-number array")
-    return tuple(_finite_float(item, field) for item in value)  # type: ignore[return-value]
-
-
-def _vector2(value: object, field: str) -> tuple[float, float]:
-    if not isinstance(value, list) or len(value) != 2:
-        raise SnapshotUnavailable(f"{field} must be a two-number array")
-    result = tuple(_finite_float(item, field) for item in value)
-    if math.hypot(*result) < 0.01:
-        raise SnapshotUnavailable(f"{field} has zero length")
-    return result  # type: ignore[return-value]
-
-
-_MONSTER_LEVEL_PATTERN = re.compile(r"Lv\.?\s*(\d+)", re.IGNORECASE)
-
-
-def parse_monster_level(display_name: str) -> int:
-    """Extract the numeric level embedded in a monster display name.
-
-    Names arrive as e.g. ``"Scorpion King <sprite ...> Lv.40"``; the level is
-    the only per-monster ordering signal the probe exposes, so we lift it out of
-    the label. Returns 0 when no ``Lv.NN`` token is present.
-    """
-    match = _MONSTER_LEVEL_PATTERN.search(display_name or "")
-    return int(match.group(1)) if match else 0
-
-
-def detect_boss_object_id(monsters: Iterable[MemoryMonster]) -> int | None:
-    """Identify the map boss as the strictly-highest-level, unique monster.
-
-    The game reports every monster (boss included) with rank "Normal", so rank
-    cannot distinguish the boss. Empirically the boss is the single monster whose
-    level tops the map (e.g. a lone Lv.40 among Lv.31-35 trash). Returns that
-    monster's object_id, or None when nothing stands out cleanly: no levels
-    parsed, or two or more monsters share the top level.
-    """
-    ranked = [(m.level, m.object_id) for m in monsters if m.level > 0]
-    if not ranked:
-        return None
-    top_level = max(level for level, _ in ranked)
-    top = [object_id for level, object_id in ranked if level == top_level]
-    if len(top) != 1:
-        return None
-    return top[0]
-
-
-_RICH_TEXT_PATTERN = re.compile(r"<[^>]*>")
-_TRAILING_LEVEL_PATTERN = re.compile(r"\s*Lv\.?\s*\d+\s*$", re.IGNORECASE)
-
-
-def normalize_boss_name(value: str) -> str:
-    """Normalize a config/display boss name without weakening exact matching."""
-    # The in-game display name puts the monster name on the first line and an
-    # element/level decoration on the next, e.g.
-    # "Lady Fey\n<sprite name=holy> <color=#FCE9EBFF>Holy</color> Lv.40".
-    # Stripping the rich-text tags leaves the element word ("Holy") as plain
-    # text, so the whole string would normalize to "lady fey holy" and never
-    # match a boss_name of "Lady Fey". Keep only the first line (the name).
-    first_line = str(value or "").split("\n", 1)[0]
-    plain = _RICH_TEXT_PATTERN.sub(" ", first_line)
-    plain = _TRAILING_LEVEL_PATTERN.sub("", plain)
-    return " ".join(plain.split()).casefold()
-
-
-def monster_matches_boss(monster: MemoryMonster, boss_name: str) -> bool:
-    wanted = normalize_boss_name(boss_name)
-    return bool(wanted) and wanted in {
-        normalize_boss_name(monster.config_id),
-        normalize_boss_name(monster.display_name),
-    }
-
-
-def select_boss_farm_target(
-    monsters: Iterable[MemoryMonster],
-    player_position: tuple[float, float, float],
-    boss_name: str,
-    previous_object_id: int | None = None,
-) -> MemoryMonster | None:
-    candidates = [
-        monster
-        for monster in monsters
-        if monster_matches_boss(monster, boss_name)
-        and monster.team == "enemy"
-        and monster.alive
-        and monster.visible
-        and not monster.training_dummy
-        and monster.health_ratio > 0.0
-    ]
-    if previous_object_id is not None:
-        previous = next(
-            (
-                monster
-                for monster in candidates
-                if monster.object_id == previous_object_id
-            ),
-            None,
-        )
-        if previous is not None:
-            return previous
-    return (
-        min(
-            candidates,
-            key=lambda monster: horizontal_distance(
-                player_position, monster.position
-            ),
-        )
-        if candidates
-        else None
-    )
-
-
-def select_boss_legendary_loot(
-    loots: Iterable[MemoryLoot],
-    player_position: tuple[float, float, float],
-    previous_object_id: int | None = None,
-) -> MemoryLoot | None:
-    candidates = [
-        loot
-        for loot in loots
-        if loot.owned_by_local_player and loot.rarity_value >= LOOT_RARITY_VALUES["legendary"]
-    ]
-    if previous_object_id is not None:
-        previous = next(
-            (loot for loot in candidates if loot.object_id == previous_object_id),
-            None,
-        )
-        if previous is not None:
-            return previous
-    return (
-        min(
-            candidates,
-            key=lambda loot: horizontal_distance(player_position, loot.position),
-        )
-        if candidates
-        else None
-    )
-
-
-def parse_memory_snapshot(
-    raw: object,
-    *,
-    now_ms: int,
-    max_age_ms: int,
-    avoid_boss: bool = False,
-) -> MemorySnapshot:
-    if not isinstance(raw, dict):
-        raise SnapshotUnavailable("memory state is not an object")
-    if raw.get("schema_version") != MEMORY_SCHEMA_VERSION:
-        raise SnapshotUnavailable("memory state schema mismatch")
-    status = str(raw.get("status", "missing"))
-    if status != "ok":
-        detail = raw.get("error")
-        relogin = raw.get("relogin")
-        if isinstance(relogin, dict):
-            phase = str(relogin.get("state", status)).strip() or status
-            attempt = int(relogin.get("attempt", 0))
-            maximum = int(relogin.get("max_attempts", 0))
-            message = str(relogin.get("message", "")).strip()
-            attempt_text = f" {attempt}/{maximum}" if maximum > 0 else ""
-            detail = f"{phase}{attempt_text}" + (f": {message}" if message else "")
-        raise SnapshotUnavailable(f"probe status={status}" + (f": {detail}" if detail else ""))
-
-    timestamp_ms = int(raw["timestamp_ms"])
-    age_ms = now_ms - timestamp_ms
-    if age_ms < -max_age_ms or age_ms > max_age_ms:
-        raise SnapshotUnavailable(f"memory state is stale ({age_ms} ms)")
-
-    player_raw = raw.get("player")
-    if not isinstance(player_raw, dict):
-        raise SnapshotUnavailable("player is unavailable")
-    player_alive = player_raw.get("alive")
-    if type(player_alive) is not bool:
-        raise SnapshotUnavailable("player.alive is unavailable")
-    summon_mount_state_available = (
-        player_raw.get("summon_mount_state_source") == "mount_controller"
-    )
-    summon_displays_raw = player_raw.get("summon_displays")
-    summon_displays_available = bool(
-        isinstance(summon_displays_raw, dict)
-        and summon_displays_raw.get("available") is True
-    )
-    summon_displays_error = (
-        str(summon_displays_raw.get("error", "") or "")
-        if isinstance(summon_displays_raw, dict)
-        else "summon_displays is unavailable"
-    )
-    summon_display_skill_ids: list[str] = []
-    if isinstance(summon_displays_raw, dict):
-        summon_items = summon_displays_raw.get("items", [])
-        if isinstance(summon_items, list):
-            for item in summon_items:
-                if not isinstance(item, dict):
-                    continue
-                skill_id = str(item.get("skill_id", "") or "").strip()
-                if skill_id:
-                    summon_display_skill_ids.append(skill_id)
-
-    status_component_raw = player_raw.get("status_component")
-    active_statuses_available = bool(
-        isinstance(status_component_raw, dict)
-        and status_component_raw.get("active_statuses_available") is True
-    )
-    active_statuses_error = (
-        str(status_component_raw.get("active_statuses_error", "") or "")
-        if isinstance(status_component_raw, dict)
-        else "status_component is unavailable"
-    )
-    active_status_ids: list[str] = []
-    if isinstance(status_component_raw, dict):
-        active_status_values = status_component_raw.get("active_status_ids", [])
-        if isinstance(active_status_values, list):
-            active_status_ids = [
-                str(value).strip()
-                for value in active_status_values
-                if str(value).strip()
-            ]
-    guardian_bond = player_raw.get("guardian_bond")
-    if not isinstance(guardian_bond, dict):
-        guardian_bond = {}
-    guardian_candidate = guardian_bond.get("candidate_unit_id", 0)
-    if type(guardian_candidate) is not int or guardian_candidate < 0:
-        guardian_candidate = 0
-    wallet_coins_available = player_raw.get("wallet_coins_available") is True
-    wallet_coins_error = str(player_raw.get("wallet_coins_error", "") or "")
-    wallet_coins = 0
-    if wallet_coins_available:
-        wallet_value = player_raw.get("wallet_coins")
-        if type(wallet_value) is int and wallet_value >= 0:
-            wallet_coins = wallet_value
-        else:
-            wallet_coins_available = False
-            wallet_coins_error = "player.wallet_coins is not a non-negative integer"
-    elif not wallet_coins_error:
-        wallet_coins_error = "wallet coins are unavailable"
-    player = MemoryPlayer(
-        position=_vector3(player_raw.get("position"), "player.position"),
-        camera_forward_xz=_vector2(
-            player_raw.get("camera_forward_xz"), "player.camera_forward_xz"
-        ),
-        camera_right_xz=_vector2(
-            player_raw.get("camera_right_xz"), "player.camera_right_xz"
-        ),
-        collider_radius=max(
-            0.0,
-            _finite_float(player_raw.get("collider_radius", 0.0), "player radius"),
-        ),
-        is_mounted_summon=bool(player_raw.get("is_mounted_summon", False)),
-        is_mountable_summon=bool(player_raw.get("is_mountable_summon", False)),
-        active_summon_count=max(
-            0, int(player_raw.get("active_summon_count", 0) or 0)
-        ),
-        has_primary_summon=bool(player_raw.get("has_primary_summon", False)),
-        summon_id=str(player_raw.get("summon_id", "") or ""),
-        mounted_summon_state_available=summon_mount_state_available,
-        summon_mount_action_available=summon_mount_state_available,
-        summon_displays_available=summon_displays_available,
-        summon_displays_error=summon_displays_error,
-        summon_display_skill_ids=tuple(summon_display_skill_ids),
-        active_statuses_available=active_statuses_available,
-        active_statuses_error=active_statuses_error,
-        active_status_ids=tuple(active_status_ids),
-        guardian_bond_available=guardian_bond.get("available") is True,
-        guardian_bond_error=str(guardian_bond.get("error", "") or ""),
-        guardian_bond_active=guardian_bond.get("has_owned_bond") is True,
-        guardian_bond_candidate_id=guardian_candidate,
-        guardian_bond_cast_error=str(guardian_bond.get("cast_error", "") or ""),
-        wallet_coins=wallet_coins,
-        wallet_coins_available=wallet_coins_available,
-        wallet_coins_error=wallet_coins_error,
-        alive=player_alive,
-    )
-
-    players: list[MemoryObservedPlayer] = []
-    players_raw = raw.get("players", [])
-    if not isinstance(players_raw, list):
-        raise SnapshotUnavailable("players is not an array")
-    for item in players_raw:
-        if not isinstance(item, dict):
-            continue
-        try:
-            observed_player = MemoryObservedPlayer(
-                object_id=int(item.get("object_id", 0)),
-                player_id=str(item.get("player_id", "")),
-                display_name=str(item.get("display_name", "")),
-                position=_vector3(item.get("position"), "observed player.position"),
-                collider_radius=max(
-                    0.0,
-                    _finite_float(
-                        item.get("collider_radius", 0.0),
-                        "observed player radius",
-                    ),
-                ),
-                alive=bool(item.get("alive", False)),
-                visible=bool(item.get("visible", False)),
-                party_member=bool(item.get("party_member", False)),
-                selected=bool(item.get("selected", False)),
-            )
-        except (SnapshotUnavailable, TypeError, ValueError):
-            continue
-        if observed_player.object_id > 0:
-            players.append(observed_player)
-
-    party_members: list[MemoryPartyMember] = []
-    party_members_raw = raw.get("party_members", [])
-    if not isinstance(party_members_raw, list):
-        raise SnapshotUnavailable("party_members is not an array")
-    for item in party_members_raw:
-        if not isinstance(item, dict):
-            continue
-        try:
-            party_member = MemoryPartyMember(
-                display_name=str(item.get("display_name", "")),
-                player_id=str(item.get("player_id", "")),
-                object_id=int(item.get("object_id", 0)),
-                map_id=int(item.get("map_id", 0)),
-                instance_id=str(item.get("instance_id", "")),
-                channel_index=int(item.get("channel_index", -1)),
-                is_local=bool(item.get("is_local", False)),
-            )
-        except (TypeError, ValueError):
-            continue
-        if party_member.player_id:
-            party_members.append(party_member)
-
-    monsters: list[MemoryMonster] = []
-    monsters_raw = raw.get("monsters", [])
-    if not isinstance(monsters_raw, list):
-        raise SnapshotUnavailable("monsters is not an array")
-    for item in monsters_raw:
-        if not isinstance(item, dict):
-            continue
-        viewport_position: tuple[float, float, float] | None = None
-        if "viewport_position" in item:
-            try:
-                viewport_position = _vector3(
-                    item.get("viewport_position"), "monster.viewport_position"
-                )
-            except (SnapshotUnavailable, TypeError, ValueError):
-                viewport_position = None
-        display_name = str(item.get("display_name", ""))
-        monster = MemoryMonster(
-            object_id=int(item.get("object_id", 0)),
-            config_id=str(item.get("config_id", "")),
-            display_name=display_name,
-            rank=str(item.get("rank", "")),
-            level=parse_monster_level(display_name),
-            position=_vector3(item.get("position"), "monster.position"),
-            health_ratio=_finite_float(item.get("health_ratio", 0.0), "monster health"),
-            collider_radius=max(
-                0.0,
-                _finite_float(item.get("collider_radius", 0.0), "monster radius"),
-            ),
-            team=str(item.get("team", "enemy")),
-            alive=bool(item.get("alive", True)),
-            visible=bool(item.get("visible", True)),
-            training_dummy=bool(item.get("training_dummy", False)),
-            viewport_position=viewport_position,
-            viewport_visible=(
-                viewport_position is not None
-                and bool(item.get("viewport_visible", False))
-            ),
-        )
-        if (
-            monster.object_id > 0
-            and monster.team == "enemy"
-            and monster.alive
-            and monster.visible
-            and not monster.training_dummy
-            and monster.health_ratio > 0.0
-        ):
-            monsters.append(monster)
-
-    if avoid_boss:
-        boss_object_id = detect_boss_object_id(monsters)
-        if boss_object_id is not None:
-            monsters = [
-                replace(monster, avoid=True)
-                if monster.object_id == boss_object_id
-                else monster
-                for monster in monsters
-            ]
-
-    loots: list[MemoryLoot] = []
-    loots_raw = raw.get("loots", [])
-    if not isinstance(loots_raw, list):
-        raise SnapshotUnavailable("loots is not an array")
-    for item in loots_raw:
-        if not isinstance(item, dict):
-            continue
-        try:
-            loot = MemoryLoot(
-                object_id=int(item.get("object_id", 0)),
-                item_id=str(item.get("item_id", "")),
-                display_name=str(item.get("display_name", "")),
-                sprite_id=str(item.get("sprite_id", "")),
-                rarity=str(item.get("rarity", "")),
-                rarity_value=int(item.get("rarity_value", 0)),
-                loot_type=str(item.get("loot_type", "")),
-                position=_vector3(item.get("position"), "loot.position"),
-                viewport_position=_vector3(
-                    item.get("viewport_position"), "loot.viewport_position"
-                ),
-                viewport_visible=bool(item.get("viewport_visible", False)),
-                locked=bool(item.get("locked", False)),
-                owner_player_id=str(item.get("owner_player_id", "")),
-                owner_party_id=int(item.get("owner_party_id", 0)),
-                owned_by_local_player=bool(
-                    item.get("owned_by_local_player", False)
-                ),
-                interaction_range=max(
-                    0.0,
-                    _finite_float(
-                        item.get("interaction_range", 0.0),
-                        "loot interaction range",
-                    ),
-                ),
-            )
-        except (SnapshotUnavailable, TypeError, ValueError):
-            continue
-        if loot.object_id > 0:
-            loots.append(loot)
-
-    map_exits: list[MemoryMapExit] = []
-    map_exits_raw = raw.get("map_exits", [])
-    if not isinstance(map_exits_raw, list):
-        raise SnapshotUnavailable("map_exits is not an array")
-    for item in map_exits_raw:
-        if not isinstance(item, dict):
-            continue
-        try:
-            map_exit = MemoryMapExit(
-                position=_vector3(item.get("position"), "map exit.position"),
-                interaction_range=max(
-                    0.0,
-                    _finite_float(
-                        item.get("interaction_range", 0.0),
-                        "map exit interaction range",
-                    ),
-                ),
-            )
-        except (SnapshotUnavailable, TypeError, ValueError):
-            continue
-        map_exits.append(map_exit)
-
-    path_raw = raw.get("path", {})
-    if not isinstance(path_raw, dict):
-        path_raw = {}
-    corners_raw = path_raw.get("corners", [])
-    corners = (
-        tuple(_vector3(value, "path.corner") for value in corners_raw)
-        if isinstance(corners_raw, list)
-        else ()
-    )
-    path = MemoryPath(
-        request_id=int(path_raw.get("request_id", 0)),
-        target_object_id=int(path_raw.get("target_object_id", 0)),
-        status=str(path_raw.get("status", "missing")),
-        corners=corners,
-        target_kind=str(path_raw.get("target_kind", "monster")).casefold(),
-    )
-    consumable_raw = raw.get("consumable_use", {})
-    if not isinstance(consumable_raw, dict):
-        consumable_raw = {}
-    consumable_use = MemoryConsumableUse(
-        request_id=max(0, int(consumable_raw.get("request_id", 0) or 0)),
-        status=str(consumable_raw.get("status", "idle") or "idle").casefold(),
-        item_id=str(consumable_raw.get("item_id", "") or ""),
-        display_name=str(consumable_raw.get("display_name", "") or ""),
-        remaining_count=int(consumable_raw.get("remaining_count", -1) or 0),
-        error=str(consumable_raw.get("error", "") or ""),
-    )
-    return MemorySnapshot(
-        timestamp_ms=timestamp_ms,
-        map_id=int(raw.get("map_id", 0)),
-        instance_id=int(raw.get("instance_id", 0)),
-        channel_index=int(raw.get("channel_index", -1)),
-        channel_count=int(raw.get("channel_count", 0)),
-        player=player,
-        players=tuple(players),
-        party_members=tuple(party_members),
-        party_state_available="party_members" in raw,
-        monsters=tuple(monsters),
-        loots=tuple(loots),
-        map_exits=tuple(map_exits),
-        map_exit_state_available="map_exits" in raw,
-        path=path,
-        player_scan=(
-            dict(raw["player_scan"])
-            if isinstance(raw.get("player_scan"), dict)
-            else None
-        ),
-        monster_scan=(
-            dict(raw["monster_scan"])
-            if isinstance(raw.get("monster_scan"), dict)
-            else None
-        ),
-        loot_scan=(
-            dict(raw["loot_scan"])
-            if isinstance(raw.get("loot_scan"), dict)
-            else None
-        ),
-        consumable_use=consumable_use,
-    )
-
-
-def no_enemy_status(snapshot: MemorySnapshot) -> str:
-    scan = snapshot.monster_scan
-    if not scan:
-        return "NO LIVING ENEMY"
-    return (
-        "NO LIVING ENEMY - "
-        f"source={scan.get('source', '?')} "
-        f"Monsters/Units={scan.get('monsters_count', '?')}/"
-        f"{scan.get('units_count', '?')} "
-        f"scene={scan.get('scene_count', '?')} "
-        f"scene-status={scan.get('scene_status', '?')} "
-        f"source/cast={scan.get('source_count', '?')}/"
-        f"{scan.get('castable', '?')} "
-        f"no-network={scan.get('rejected_no_network_object', '?')} "
-        f"other-map={scan.get('rejected_other_map', '?')} "
-        f"unknown/nav-ok/nav-bad={scan.get('unknown_map_candidates', '?')}/"
-        f"{scan.get('accepted_by_navmesh', '?')}/"
-        f"{scan.get('rejected_no_navmesh', '?')} "
-        f"inactive/hidden/dead={scan.get('rejected_inactive', '?')}/"
-        f"{scan.get('rejected_not_displayed', '?')}/"
-        f"{scan.get('rejected_dead', '?')} "
-        f"no-data/not-enemy={scan.get('rejected_no_data', '?')}/"
-        f"{scan.get('rejected_not_enemy', '?')} "
-        f"teams={scan.get('team_values', '?')} "
-        f"network-maps={scan.get('network_maps', '?')} "
-        f"nav-error={scan.get('navmesh_filter_error', '')}"
-    )
-
-
-def snapshot_error_log_key(error: SnapshotUnavailable) -> str:
-    """Collapse changing age/details so repeated safe stops are rate limited."""
-    return "snapshot:" + str(error).split(" (", 1)[0]
-
-
-def start_navigation_earnings(
-    state: NavigationEarningsState, *, now: float, tracking: bool = True
-) -> None:
-    """Start one non-persistent formal-navigation earnings session."""
-    state.session_active = True
-    state.tracking_active = bool(tracking)
-    state.segment_started_at = now if tracking else 0.0
-    state.elapsed_seconds = 0.0
-    state.gross_income = 0
-    state.last_wallet_coins = None
-    state.current_wallet_coins = None
-    state.last_snapshot_timestamp_ms = 0
-    state.wallet_sample_count = 0
-    state.data_incomplete = False
-    state.final_balance_from_last_sample = False
-
-
-def pause_navigation_earnings(
-    state: NavigationEarningsState, *, now: float
-) -> None:
-    """Exclude following mode from both elapsed time and wallet sampling."""
-    if not state.session_active or not state.tracking_active:
-        return
-    state.elapsed_seconds += max(0.0, now - state.segment_started_at)
-    state.tracking_active = False
-    state.segment_started_at = 0.0
-    state.last_wallet_coins = None
-    state.last_snapshot_timestamp_ms = 0
-
-
-def resume_navigation_earnings(
-    state: NavigationEarningsState, *, now: float
-) -> None:
-    """Resume navigation after following without bridging wallet deltas."""
-    if not state.session_active or state.tracking_active:
-        return
-    state.tracking_active = True
-    state.segment_started_at = now
-    state.last_wallet_coins = None
-    state.last_snapshot_timestamp_ms = 0
-
-
-def mark_navigation_earnings_incomplete(
-    state: NavigationEarningsState, *, final_balance_from_last_sample: bool = False
-) -> None:
-    if state.session_active and state.tracking_active:
-        state.data_incomplete = True
-        if final_balance_from_last_sample:
-            state.final_balance_from_last_sample = True
-
-
-def observe_navigation_wallet(
-    state: NavigationEarningsState,
-    *,
-    snapshot_timestamp_ms: int,
-    wallet_coins_available: bool,
-    wallet_coins: int = 0,
-) -> None:
-    """Accumulate positive wallet deltas from each new navigation snapshot."""
-    if not state.session_active or not state.tracking_active:
-        return
-    timestamp_ms = int(snapshot_timestamp_ms)
-    if timestamp_ms <= state.last_snapshot_timestamp_ms:
-        return
-    state.last_snapshot_timestamp_ms = timestamp_ms
-    if not wallet_coins_available or type(wallet_coins) is not int or wallet_coins < 0:
-        state.data_incomplete = True
-        return
-    if state.last_wallet_coins is not None and wallet_coins > state.last_wallet_coins:
-        state.gross_income += wallet_coins - state.last_wallet_coins
-    state.last_wallet_coins = wallet_coins
-    state.current_wallet_coins = wallet_coins
-    state.wallet_sample_count += 1
-
-
-def finish_navigation_earnings(
-    state: NavigationEarningsState, *, now: float
-) -> NavigationEarningsReport | None:
-    """Finish once; subsequent stop paths return no duplicate report."""
-    if not state.session_active:
-        return None
-    pause_navigation_earnings(state, now=now)
-    report = NavigationEarningsReport(
-        elapsed_seconds=state.elapsed_seconds,
-        gross_income=state.gross_income,
-        current_wallet_coins=state.current_wallet_coins,
-        wallet_sample_count=state.wallet_sample_count,
-        data_incomplete=state.data_incomplete,
-        final_balance_from_last_sample=state.final_balance_from_last_sample,
-    )
-    state.session_active = False
-    return report
-
-
-def format_navigation_earnings_report(report: NavigationEarningsReport) -> str:
-    total_seconds = max(0, int(report.elapsed_seconds))
-    hours, remainder = divmod(total_seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    duration = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-    if report.wallet_sample_count <= 0 or report.current_wallet_coins is None:
-        wallet_text = "金幣總收入 無法計算；目前餘額 無法取得"
-    else:
-        wallet_text = (
-            f"金幣總收入 {report.gross_income:,}；"
-            f"目前餘額 {report.current_wallet_coins:,}"
-        )
-    warning = ""
-    if report.data_incomplete:
-        warning = "（金幣資料曾中斷，收入可能低估"
-        if report.final_balance_from_last_sample and report.current_wallet_coins is not None:
-            warning += "；停止餘額採最後有效值"
-        warning += "）"
-    return f"導航統計：運行 {duration}；{wallet_text}。{warning}"
-
-
-def load_memory_snapshot(
-    path: Path,
-    max_age_ms: int,
-    *,
-    now_ms: int | None = None,
-    avoid_boss: bool = False,
-) -> MemorySnapshot:
-    last_error: OSError | json.JSONDecodeError | None = None
-    raw: object | None = None
-    for attempt in range(IPC_READ_ATTEMPTS):
-        try:
-            raw = json.loads(_read_windows_shared_text(path))
-            break
-        except (OSError, json.JSONDecodeError) as error:
-            last_error = error
-            if attempt + 1 < IPC_READ_ATTEMPTS:
-                time.sleep(IPC_RETRY_DELAY_SEC * (2**attempt))
-    if raw is None:
-        raise SnapshotUnavailable(
-            f"cannot read memory state after {IPC_READ_ATTEMPTS} attempts: {last_error}"
-        ) from last_error
-    return parse_memory_snapshot(
-        raw,
-        now_ms=int(time.time() * 1000) if now_ms is None else now_ms,
-        max_age_ms=max(1, int(max_age_ms)),
-        avoid_boss=avoid_boss,
-    )
-
-
-def wait_for_wallet_snapshot(
-    path: Path,
-    max_age_ms: int,
-    *,
-    after_timestamp_ms: int,
-    wait_timeout_ms: int = 1000,
-    avoid_boss: bool = False,
-) -> MemorySnapshot:
-    """Wait briefly for a post-stop-request snapshot with wallet data."""
-    deadline = time.monotonic() + max(100, int(wait_timeout_ms)) / 1000
-    last_error: SnapshotUnavailable | None = None
-    while True:
-        try:
-            snapshot = load_memory_snapshot(
-                path, max_age_ms, avoid_boss=avoid_boss
-            )
-            if snapshot.timestamp_ms < int(after_timestamp_ms):
-                last_error = SnapshotUnavailable(
-                    "wallet snapshot has not refreshed yet"
-                )
-            elif not snapshot.player.wallet_coins_available:
-                detail = snapshot.player.wallet_coins_error or "unavailable"
-                last_error = SnapshotUnavailable(f"wallet coins unavailable: {detail}")
-            else:
-                return snapshot
-        except SnapshotUnavailable as error:
-            last_error = error
-        if time.monotonic() >= deadline:
-            assert last_error is not None
-            raise SnapshotUnavailable(
-                f"timed out waiting for wallet snapshot: {last_error}"
-            ) from last_error
-        time.sleep(0.05)
-
-
-def wait_for_party_snapshot(
-    path: Path,
-    max_age_ms: int,
-    *,
-    after_timestamp_ms: int,
-    wait_timeout_ms: int = 1500,
-) -> MemorySnapshot:
-    """Wait for a fresh party-only probe response after an F2 wake request."""
-    deadline = time.monotonic() + max(100, int(wait_timeout_ms)) / 1000
-    last_error: SnapshotUnavailable | None = None
-    while True:
-        try:
-            snapshot = load_memory_snapshot(path, max_age_ms)
-            if (
-                snapshot.timestamp_ms >= int(after_timestamp_ms)
-                and snapshot.party_state_available
-            ):
-                return snapshot
-            last_error = SnapshotUnavailable("party snapshot has not refreshed yet")
-        except SnapshotUnavailable as error:
-            last_error = error
-        if time.monotonic() >= deadline:
-            assert last_error is not None
-            raise SnapshotUnavailable(
-                f"timed out waiting for party snapshot: {last_error}"
-            ) from last_error
-        time.sleep(0.05)
-
-
-def _read_windows_shared_text(path: Path) -> str:
-    """Read one stable generation while allowing the probe to replace the path."""
-    handle = _CREATE_FILE(
-        str(path),
-        _GENERIC_READ,
-        _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
-        None,
-        _OPEN_EXISTING,
-        _FILE_ATTRIBUTE_NORMAL,
-        None,
-    )
-    if handle == _INVALID_HANDLE_VALUE:
-        raise ctypes.WinError()
-
-    descriptor: int | None = None
-    try:
-        descriptor = msvcrt.open_osfhandle(
-            int(handle), os.O_RDONLY | getattr(os, "O_BINARY", 0)
-        )
-    except Exception:
-        _CLOSE_HANDLE(handle)
-        raise
-
-    with os.fdopen(descriptor, "rb") as stream:
-        return stream.read().decode("utf-8")
-
-
-def atomic_write_json(path: Path, payload: dict[str, object]) -> None:
-    # 用「行程 + 執行緒」唯一的暫存檔名，避免多個實例（或多執行緒）共用同一個
-    # 固定 .tmp 檔而互搶：先搶到的 os.replace 會把 .tmp 移走，另一個就會拿到
-    # WinError 2（找不到檔案）而整個 crash。
-    temporary = path.with_name(
-        f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
-    )
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-        encoding="utf-8",
-    )
-    last_error: OSError | None = None
-    for attempt in range(IPC_WRITE_ATTEMPTS):
-        try:
-            os.replace(temporary, path)
-            return
-        except OSError as error:
-            last_error = error
-            if attempt + 1 < IPC_WRITE_ATTEMPTS:
-                time.sleep(IPC_RETRY_DELAY_SEC * (2**attempt))
-    # 持續失敗時清掉殘留的暫存檔，避免留下垃圾。
-    try:
-        temporary.unlink()
-    except OSError:
-        pass
-    assert last_error is not None
-    raise last_error
-
-
-def write_navigation_request(
-    path: Path,
-    request_id: int,
-    target_object_id: int,
-    *,
-    target_kind: str = "monster",
-    now_ms: int | None = None,
-    probe_active: bool = False,
-    loot_scan_active: bool = False,
-    party_follow_active: bool = False,
-    bot_active: bool = False,
-    movement_keys: Iterable[str] = (),
-    movement_world: tuple[int, int, int] = (0, 0, 0),
-    shift_keys: Iterable[str] = (),
-    summon_action: str = "",
-    skill_key_request_id: int = 0,
-    skill_key: str = "",
-    skill_key_target_summon: bool = False,
-    loot_interact: int = 0,
-    loot_interact_object_id: int = 0,
-    focus_target_object_id: int = 0,
-    focus_target_world: tuple[float, float, float] = (0.0, 0.0, 0.0),
-    background_input_mode: str = "inputs",
-    background_skill_mode: str = "capture",
-    auto_relogin_enabled: bool = False,
-    auto_relogin_disconnect_grace_sec: float = 3.0,
-    auto_relogin_builtin_wait_max_sec: float = 30.0,
-    auto_relogin_attempt_timeout_sec: float = 30.0,
-    auto_relogin_retry_delay_sec: float = 10.0,
-    auto_relogin_max_attempts: int = 5,
-    follow_channel_request_id: int = 0,
-    follow_player_id: str = "",
-    channel_switch_request_id: int = 0,
-    channel_switch_index: int = -1,
-    consumable_use_request_id: int = 0,
-    consumable_name: str = "",
-) -> None:
-    normalized_kind = str(target_kind).strip().casefold()
-    if normalized_kind not in {"none", "monster", "loot", "player"}:
-        raise ValueError("target_kind must be none, monster, loot, or player")
-    movement_key_set = set(movement_keys)
-    shift_key_set = set(shift_keys)
-    normalized_movement_world = tuple(
-        max(-1, min(1, int(component))) for component in movement_world
-    )
-    if len(normalized_movement_world) != 3:
-        raise ValueError("movement_world must contain exactly three components")
-    normalized_focus_target_world = tuple(
-        float(component) for component in focus_target_world
-    )
-    if len(normalized_focus_target_world) != 3:
-        raise ValueError("focus_target_world must contain exactly three components")
-    if not all(math.isfinite(component) for component in normalized_focus_target_world):
-        raise ValueError("focus_target_world components must be finite")
-    normalized_background_input_mode = str(background_input_mode).strip().casefold()
-    if normalized_background_input_mode not in {
-        "inputs",
-        "both",
-        "apply",
-        "send",
-        "send_apply",
-        "send_process",
-    }:
-        raise ValueError(
-            "background_input_mode must be inputs, both, apply, send, "
-            "send_apply, or send_process"
-        )
-    normalized_background_skill_mode = str(background_skill_mode).strip().casefold()
-    if normalized_background_skill_mode not in {
-        "capture",
-        "process",
-        "click",
-        "process_click",
-    }:
-        raise ValueError(
-            "background_skill_mode must be capture, process, click, or process_click"
-        )
-    normalized_skill_key = str(skill_key).strip().casefold()
-    if normalized_skill_key and normalized_skill_key not in NUMPAD_SKILL_KEYS:
-        raise ValueError("skill_key must be numpad0 through numpad9")
-    payload: dict[str, object] = {
-        "schema_version": MEMORY_SCHEMA_VERSION,
-        "request_id": int(request_id),
-        "target_kind": normalized_kind,
-        "target_object_id": int(target_object_id),
-        "timestamp_ms": int(time.time() * 1000) if now_ms is None else int(now_ms),
-        "probe_active": bool(probe_active),
-        "loot_scan_active": bool(loot_scan_active),
-        "party_follow_active": bool(party_follow_active),
-        "bot_active": bool(bot_active),
-        "movement_keys": "".join(
-            key for key in ("w", "a", "s", "d") if key in movement_key_set
-        ),
-        "movement_world": list(normalized_movement_world),
-        "shift_keys": ",".join(
-            key for key in HELD_SHIFT_KEYS if key in shift_key_set
-        ),
-        "summon_action": (
-            str(summon_action).strip().casefold()
-            if str(summon_action).strip().casefold() in {"reanimation", "mount"}
-            else ""
-        ),
-        "skill_key_request_id": max(0, int(skill_key_request_id)),
-        "skill_key": normalized_skill_key,
-        "skill_key_target_summon": bool(skill_key_target_summon),
-        "loot_interact": max(0, int(loot_interact)),
-        "loot_interact_object_id": max(0, int(loot_interact_object_id)),
-        "focus_target_object_id": max(0, int(focus_target_object_id)),
-        "focus_target_world": list(normalized_focus_target_world),
-        "background_input_mode": normalized_background_input_mode,
-        "background_skill_mode": normalized_background_skill_mode,
-        "auto_relogin_enabled": bool(auto_relogin_enabled),
-        "auto_relogin_disconnect_grace_sec": max(
-            0.5, float(auto_relogin_disconnect_grace_sec)
-        ),
-        "auto_relogin_builtin_wait_max_sec": max(
-            0.0, float(auto_relogin_builtin_wait_max_sec)
-        ),
-        "auto_relogin_attempt_timeout_sec": max(
-            1.0, float(auto_relogin_attempt_timeout_sec)
-        ),
-        "auto_relogin_retry_delay_sec": max(
-            0.0, float(auto_relogin_retry_delay_sec)
-        ),
-        "auto_relogin_max_attempts": min(
-            20, max(1, int(auto_relogin_max_attempts))
-        ),
-    }
-    normalized_follow_player_id = str(follow_player_id).strip()
-    if normalized_follow_player_id and (
-        bool(party_follow_active) or int(follow_channel_request_id) > 0
-    ):
-        payload["follow_player_id"] = normalized_follow_player_id
-        if int(follow_channel_request_id) > 0:
-            payload["follow_channel_request_id"] = int(follow_channel_request_id)
-    if int(channel_switch_request_id) > 0 and int(channel_switch_index) >= 0:
-        payload["channel_switch_request_id"] = int(channel_switch_request_id)
-        payload["channel_switch_index"] = int(channel_switch_index)
-    normalized_consumable_name = str(consumable_name).strip()
-    if int(consumable_use_request_id) > 0 and normalized_consumable_name:
-        payload["consumable_use_request_id"] = int(consumable_use_request_id)
-        payload["consumable_name"] = normalized_consumable_name
-    atomic_write_json(path, payload)
-
-
-def horizontal_distance(
-    left: tuple[float, float, float], right: tuple[float, float, float]
-) -> float:
-    return math.hypot(left[0] - right[0], left[2] - right[2])
-
-
-def summon_mount_blocks_navigation(
-    config: BotConfig,
-    player: MemoryPlayer,
-    *,
-    send_input: bool,
-    active: bool,
-) -> bool:
-    """Pause movement while Python sends the fixed 9 then 0 key sequence."""
-    return bool(
-        config.job_type in NAVIGATION_UPKEEP_JOB_TYPES
-        and send_input
-        and active
-        and player.mounted_summon_state_available
-        and player.summon_mount_action_available
-        and not player.is_mounted_summon
-    )
-
-
-def reset_summon_mount_key_state(state: SummonMountKeyState) -> None:
-    state.phase = "idle"
-    state.stage_started_at = 0.0
-    state.next_mount_retry_at = 0.0
-    state.retry_after = 0.0
-    state.error = ""
-
-
-def advance_summon_mount_hotkeys(
-    state: SummonMountKeyState,
-    *,
-    mounted: bool,
-    summon_ready: bool,
-    enabled: bool,
-    now: float,
-    reanimation_key: str,
-    mount_key: str,
-    key_hold_ms: int,
-    reanimation_delay_ms: int,
-    confirm_timeout_ms: int,
-    mount_key_retry_delay_ms: int,
-    retry_delay_ms: int,
-    press_key: Callable[[str, int], None],
-) -> bool:
-    """Send reanimation, wait for the summon to exist, then mount.
-
-    ``summon_ready`` reflects whether an active summon actually exists (the
-    game's active summon state): only press the mount key once a summon is on
-    the field. While waiting for mount confirmation, retry only the mount key at
-    ``mount_key_retry_delay_ms`` intervals. The confirmation timeout always runs
-    from the first mount-key press; retries do not extend it. If mounting is not
-    confirmed, retry_wait re-presses reanimation after ``retry_delay_ms``.
-    """
-    if not enabled:
-        reset_summon_mount_key_state(state)
-        return False
-    if mounted:
-        state.phase = "mounted"
-        state.stage_started_at = 0.0
-        state.next_mount_retry_at = 0.0
-        state.retry_after = 0.0
-        state.error = ""
-        return False
-    if now < state.retry_after:
-        state.phase = "retry_wait"
-        return True
-
-    try:
-        if state.phase in {"idle", "inactive", "mounted", "retry_wait"}:
-            press_key(reanimation_key, max(0, int(key_hold_ms)))
-            state.phase = "reanimation_sent"
-            state.stage_started_at = now
-            state.next_mount_retry_at = 0.0
-            state.error = ""
-        elif state.phase == "reanimation_sent":
-            elapsed_ms = (now - state.stage_started_at) * 1000
-            if summon_ready and elapsed_ms >= max(0, int(reanimation_delay_ms)):
-                press_key(mount_key, max(0, int(key_hold_ms)))
-                state.phase = "mount_sent"
-                state.stage_started_at = now
-                state.next_mount_retry_at = (
-                    now + max(0, int(mount_key_retry_delay_ms)) / 1000
-                )
-                state.error = ""
-            elif elapsed_ms >= max(1, int(confirm_timeout_ms)):
-                state.phase = "retry_wait"
-                state.error = "summon was not ready"
-                state.retry_after = now + max(0, int(retry_delay_ms)) / 1000
-        elif state.phase == "mount_sent":
-            elapsed_ms = (now - state.stage_started_at) * 1000
-            if elapsed_ms >= max(1, int(confirm_timeout_ms)):
-                state.phase = "retry_wait"
-                state.next_mount_retry_at = 0.0
-                state.error = "mount was not confirmed"
-                state.retry_after = now + max(0, int(retry_delay_ms)) / 1000
-            elif summon_ready and now >= state.next_mount_retry_at:
-                press_key(mount_key, max(0, int(key_hold_ms)))
-                state.next_mount_retry_at = (
-                    now + max(0, int(mount_key_retry_delay_ms)) / 1000
-                )
-    except Exception as error:
-        state.phase = "retry_wait"
-        state.next_mount_retry_at = 0.0
-        state.error = f"{type(error).__name__}: {error}"
-        state.retry_after = now + max(0, int(retry_delay_ms)) / 1000
-    return True
-
-
-def summon_mount_wait_status(
-    state: SummonMountKeyState, reanimation_key: str = "9", mount_key: str = "0"
-) -> str:
-    phase = state.phase.strip().upper() or "WAITING"
-    error = f" ERROR={state.error}" if state.error else ""
-    return f"SUMMON MOUNT {phase} KEY={reanimation_key}->{mount_key}{error}"
-
-
-def reset_summoner_check_state(state: SummonerCheckState) -> None:
-    state.phase = "idle"
-    state.item_id = ""
-    state.settle_until = 0.0
-    state.retry_after.clear()
-    state.error = ""
-
-
-def summoner_checks_enabled(
-    config: BotConfig,
-    player: MemoryPlayer,
-    *,
-    send_input: bool,
-    active: bool,
-    follow_mode: bool,
-) -> bool:
-    return bool(
-        config.job_type in NAVIGATION_UPKEEP_JOB_TYPES
-        and send_input
-        and (active or follow_mode)
-        and player.alive
-        and any(
-            bool(config.summoner_checks[check_id]["enabled"])
-            for check_id in SUMMONER_CHECK_ORDER
-        )
-    )
-
-
-def missing_summoner_checks(
-    config: BotConfig, player: MemoryPlayer
-) -> tuple[tuple[str, ...], str]:
-    """Return missing configured IDs and an unavailable-source error."""
-    enabled_ids = tuple(
-        check_id
-        for check_id in SUMMONER_CHECK_ORDER
-        if bool(config.summoner_checks[check_id]["enabled"])
-    )
-    if not enabled_ids:
-        return (), ""
-    needs_summons = any(item in SUMMONER_SUMMON_IDS for item in enabled_ids)
-    needs_buffs = any(
-        item in SUMMONER_BUFF_IDS and item != "GuardianBond" for item in enabled_ids
-    )
-    unavailable: list[str] = []
-    if "GuardianBond" in enabled_ids and not player.guardian_bond_available:
-        unavailable.append(
-            "GuardianBond ownership/bond state unavailable; updated probe required"
-            + (f": {player.guardian_bond_error}" if player.guardian_bond_error else "")
-        )
-    if needs_summons and not player.summon_displays_available:
-        unavailable.append(
-            "SummonDisplays_C"
-            + (
-                f": {player.summon_displays_error}"
-                if player.summon_displays_error
-                else ""
-            )
-        )
-    if needs_buffs and not player.active_statuses_available:
-        unavailable.append(
-            "StatusDisplays_C"
-            + (
-                f": {player.active_statuses_error}"
-                if player.active_statuses_error
-                else ""
-            )
-        )
-    if unavailable:
-        return (), "; ".join(unavailable)
-
-    summon_ids = {value.casefold() for value in player.summon_display_skill_ids}
-    status_ids = {value.casefold() for value in player.active_status_ids}
-    missing = tuple(
-        check_id
-        for check_id in enabled_ids
-        if (
-            not player.guardian_bond_active
-            if check_id == "GuardianBond"
-            else (
-                check_id.casefold() not in summon_ids
-                if check_id in SUMMONER_SUMMON_IDS
-                else check_id.casefold() not in status_ids
-            )
-        )
-    )
-    return missing, ""
-
-
-def advance_summoner_checks(
-    state: SummonerCheckState,
-    config: BotConfig,
-    player: MemoryPlayer,
-    *,
-    enabled: bool,
-    now: float,
-    press_key: Callable[..., bool | None],
-) -> bool:
-    """Maintain selected summons/buffs and report whether navigation is gated."""
-    if not enabled:
-        reset_summoner_check_state(state)
-        return False
-
-    missing, unavailable_error = missing_summoner_checks(config, player)
-    if unavailable_error:
-        state.phase = "unavailable"
-        state.item_id = ""
-        state.error = unavailable_error
-        state.settle_until = 0.0
-        return True
-
-    present = set(SUMMONER_CHECK_ORDER).difference(missing)
-    for check_id in present:
-        state.retry_after.pop(check_id, None)
-    if not missing:
-        state.phase = "ready"
-        state.item_id = ""
-        state.error = ""
-        state.settle_until = 0.0
-        return False
-    if now < state.settle_until:
-        state.phase = "settling"
-        if state.item_id == "GuardianBond":
-            state.error = player.guardian_bond_cast_error
-        return True
-
-    for check_id in missing:
-        if now < state.retry_after.get(check_id, 0.0):
-            continue
-        if check_id == "GuardianBond" and player.guardian_bond_candidate_id <= 0:
-            state.phase = "waiting"
-            state.item_id = check_id
-            state.error = "No living summon owned by the local player"
-            continue
-        key = str(config.summoner_checks[check_id]["key"])
-        try:
-            sent = press_key(key, check_id in SUMMONER_TARGET_SUMMON_IDS)
-            state.phase = "sent" if sent is not False else "blocked"
-            state.error = "" if sent is not False else "skill request was blocked"
-        except Exception as error:
-            state.phase = "error"
-            state.error = f"{type(error).__name__}: {error}"
-        state.item_id = check_id
-        state.retry_after[check_id] = now + max(
-            2500 if check_id == "GuardianBond" else 0,
-            int(config.summoner_check_retry_delay_ms),
-        ) / 1000
-        state.settle_until = now + max(
-            2500 if check_id == "GuardianBond" else 0,
-            int(config.summoner_check_settle_ms),
-        ) / 1000
-        return True
-
-    state.phase = "waiting"
-    state.item_id = missing[0]
-    state.error = (
-        ("No living summon owned by the local player"
-         if player.guardian_bond_candidate_id <= 0 else player.guardian_bond_cast_error)
-        if state.item_id == "GuardianBond" else ""
-    )
-    return True
-
-
-def summoner_check_wait_status(state: SummonerCheckState) -> str:
-    phase = state.phase.strip().upper() or "WAITING"
-    item = f" ITEM={state.item_id}" if state.item_id else ""
-    error = f" ERROR={state.error}" if state.error else ""
-    return f"SUMMONER CHECK {phase}{item}{error}"
-
-
-LOOT_RARITY_VALUES = {
-    "common": 0,
-    "rare": 1,
-    "unique": 2,
-    "legendary": 3,
-}
-
-MODE_NAMES = {
-    1: "正常",
-    2: "火車",
-    3: "自動刷王",
-}
-
-
-def should_advance_train_target(
-    mode: int,
-    *,
-    arrived: bool,
-    send_input: bool,
-) -> bool:
-    """Only a running train-mode bot switches immediately on arrival."""
-    return mode == 2 and arrived and send_input
-
-
-def loot_minimum_rarity_value(value: str | int) -> int:
-    if isinstance(value, int):
-        return min(3, max(0, value))
-    normalized = str(value).strip().casefold()
-    if normalized not in LOOT_RARITY_VALUES:
-        raise ValueError(
-            "memory_loot_min_rarity must be Common, Rare, Unique, or Legendary"
-        )
-    return LOOT_RARITY_VALUES[normalized]
-
-
-def loot_ownership_label(loot: MemoryLoot) -> str:
-    if loot.owned_by_local_player:
-        return "OWN"
-    return "FOREIGN" if loot.owner_player_id else "PUBLIC"
-
-
-def select_memory_loot(
-    loots: Iterable[MemoryLoot],
-    player: MemoryPlayer,
-    minimum_rarity: str | int,
-    previous_object_id: int | None = None,
-    *,
-    skipped_until: dict[int, float] | None = None,
-    now: float = 0.0,
-    range_padding_world: float = 0.75,
-    max_distance_world: float = 3.0,
-) -> MemoryLoot | None:
-    minimum = loot_minimum_rarity_value(minimum_rarity)
-    active_skips = {
-        object_id: expiry
-        for object_id, expiry in (skipped_until or {}).items()
-        if expiry > now
-    }
-    eligible: list[MemoryLoot] = []
-    for loot in loots:
-        if loot.locked or loot_is_equipment(loot):
-            continue
-        if loot.rarity_value >= minimum:
-            eligible.append(loot)
-    nearby = [
-        loot
-        for loot in eligible
-        if loot_is_within_pickup_range(
-            player,
-            loot,
-            range_padding_world=range_padding_world,
-            max_distance_world=max_distance_world,
-        )
-    ]
-    if previous_object_id is not None:
-        previous = next(
-            (loot for loot in nearby if loot.object_id == previous_object_id), None
-        )
-        if previous is not None:
-            return previous
-    if nearby:
-        return min(
-            nearby,
-            key=lambda loot: (
-                horizontal_distance(player.position, loot.position),
-                -loot.rarity_value,
-                loot.object_id,
-            ),
-        )
-    remote_owned = [
-        loot
-        for loot in eligible
-        if loot.owned_by_local_player and loot.object_id not in active_skips
-    ]
-    if previous_object_id is not None:
-        previous = next(
-            (
-                loot
-                for loot in remote_owned
-                if loot.object_id == previous_object_id
-            ),
-            None,
-        )
-        if previous is not None:
-            return previous
-    return min(
-        remote_owned,
-        key=lambda loot: (
-            -loot.rarity_value,
-            horizontal_distance(player.position, loot.position),
-            loot.object_id,
-        ),
-        default=None,
-    )
-
-
-def loot_pickup_radius(
-    player: MemoryPlayer,
-    loot: MemoryLoot,
-    *,
-    range_padding_world: float,
-    max_distance_world: float,
-) -> float:
-    # The server accepts pickup only when the player *center* is within the
-    # loot's InteractionRange; it does NOT credit the player's collider radius
-    # (empirically a 2.83-world-unit centre gap was rejected at IR=1.0 with a
-    # 2.0 collider). Approaching by interaction_range plus a small (often
-    # negative) padding, without adding collider_radius, keeps the press point
-    # inside the range the game actually honours.
-    interaction_radius = max(0.0, loot.interaction_range) + range_padding_world
-    return min(max(0.0, max_distance_world), max(0.0, interaction_radius))
-
-
-def loot_is_within_pickup_range(
-    player: MemoryPlayer,
-    loot: MemoryLoot,
-    *,
-    range_padding_world: float,
-    max_distance_world: float,
-) -> bool:
-    return horizontal_distance(player.position, loot.position) <= loot_pickup_radius(
-        player,
-        loot,
-        range_padding_world=range_padding_world,
-        max_distance_world=max_distance_world,
-    )
-
-
-def loot_pickup_hold_radius(
-    player: MemoryPlayer,
-    loot: MemoryLoot,
-    *,
-    range_padding_world: float,
-    hysteresis_world: float,
-    max_distance_world: float,
-) -> float:
-    """Return the safe exit radius after pickup preparation has started.
-
-    The entry radius may intentionally sit inside ``InteractionRange`` (for
-    example 0.8 for a 1.0-range drop).  Once all keys are being released, keep
-    the player stopped through small snapshot/movement overshoot, but never
-    widen the hold radius past the server's real interaction range.
-    """
-    entry_radius = loot_pickup_radius(
-        player,
-        loot,
-        range_padding_world=range_padding_world,
-        max_distance_world=max_distance_world,
-    )
-    server_radius = min(
-        max(0.0, max_distance_world),
-        max(0.0, loot.interaction_range),
-    )
-    return max(
-        entry_radius,
-        min(
-            server_radius,
-            entry_radius + max(0.0, hysteresis_world),
-        ),
-    )
-
-
-def reset_loot_chase(
-    state: LootChaseState,
-    *,
-    now: float,
-    target_object_id: int | None = None,
-    player_position: tuple[float, float, float] | None = None,
-) -> None:
-    state.target_object_id = target_object_id
-    state.started_at = now
-    state.path_invalid_since = None
-    state.progress_anchor = player_position
-    state.progress_started_at = now
-    state.unstuck_started_at = None
-    state.unstuck_anchor = None
-    state.unstuck_attempt = 0
-    state.release_started_at = None
-
-
-def loot_chase_failure_reason(
-    state: LootChaseState,
-    *,
-    now: float,
-    path_invalid_grace_sec: float,
-    chase_timeout_sec: float,
-    enforce_timeout: bool,
-    unstuck_failed: bool = False,
-) -> str | None:
-    if unstuck_failed:
-        return "unstuck"
-    if (
-        state.path_invalid_since is not None
-        and now - state.path_invalid_since >= max(0.0, path_invalid_grace_sec)
-    ):
-        return "path"
-    if enforce_timeout and now - state.started_at >= max(0.1, chase_timeout_sec):
-        return "timeout"
-    return None
-
-
-def track_memory_loot_candidate(
-    selected: MemoryLoot | None,
-    previous_object_id: int | None,
-    previous_frames: int,
-) -> tuple[int | None, int]:
-    if selected is None:
-        return None, 0
-    if selected.object_id == previous_object_id:
-        return selected.object_id, previous_frames + 1
-    return selected.object_id, 1
-
-
-def select_memory_target(
-    monsters: Iterable[MemoryMonster],
-    player_position: tuple[float, float, float],
-    previous_object_id: int | None,
-    skipped_until: dict[int, float],
-    *,
-    now: float,
-    blocked_object_ids: set[int] | frozenset[int] = frozenset(),
-) -> tuple[MemoryMonster | None, dict[int, float]]:
-    active_skips = {
-        object_id: expiry for object_id, expiry in skipped_until.items() if expiry > now
-    }
-    candidates = [
-        monster
-        for monster in monsters
-        if monster.team == "enemy"
-        and monster.alive
-        and monster.visible
-        and not monster.training_dummy
-        and monster.health_ratio > 0.0
-        and not monster.avoid
-        and monster.object_id not in active_skips
-        and monster.object_id not in blocked_object_ids
-    ]
-    if previous_object_id is not None:
-        previous = next(
-            (monster for monster in candidates if monster.object_id == previous_object_id),
-            None,
-        )
-        if previous is not None:
-            return previous, active_skips
-    if not candidates:
-        return None, active_skips
-    return (
-        min(candidates, key=lambda monster: horizontal_distance(player_position, monster.position)),
-        active_skips,
-    )
-
-
-def find_follow_player_by_name(
-    players: Iterable[MemoryObservedPlayer], name: str
-) -> MemoryObservedPlayer | None:
-    """Resolve one living same-map player by exact display name or PlayerId."""
-    query = str(name).strip().casefold()
-    if not query:
-        return None
-    matches = [
-        player
-        for player in players
-        if player.object_id > 0
-        and bool(player.player_id)
-        and player.alive
-        and (
-            player.display_name.strip().casefold() == query
-            or player.player_id.strip().casefold() == query
-        )
-    ]
-    return matches[0] if len(matches) == 1 else None
-
-
-def find_follow_party_member_by_name(
-    party_members: Iterable[MemoryPartyMember], name: str
-) -> MemoryPartyMember | None:
-    """Resolve one non-local party member by exact display name or PlayerId."""
-    query = str(name).strip().casefold()
-    if not query:
-        return None
-    matches = [
-        member
-        for member in party_members
-        if member.player_id
-        and not member.is_local
-        and (
-            member.display_name.strip().casefold() == query
-            or member.player_id.strip().casefold() == query
-        )
-    ]
-    return matches[0] if len(matches) == 1 else None
-
-
-def find_follow_party_member(
-    party_members: Iterable[MemoryPartyMember], player_id: str
-) -> MemoryPartyMember | None:
-    if not player_id:
-        return None
-    return next(
-        (
-            member
-            for member in party_members
-            if member.player_id == player_id and not member.is_local
-        ),
-        None,
-    )
-
-
-def find_local_party_member(
-    party_members: Iterable[MemoryPartyMember],
-) -> MemoryPartyMember | None:
-    return next((member for member in party_members if member.is_local), None)
-
-
-def party_channel_number(member: MemoryPartyMember) -> int | None:
-    """Convert the game's zero-based ChannelIndex to its displayed number."""
-    return member.channel_index + 1 if member.channel_index >= 0 else None
-
-
-def party_member_needs_channel_switch(
-    target: MemoryPartyMember,
-    local: MemoryPartyMember | None,
-    current_map_id: int,
-) -> bool:
-    if target.map_id > 0 and target.map_id != current_map_id:
-        return False
-    if local is None or target.channel_index < 0:
-        return True
-    return (
-        bool(target.instance_id)
-        and target.instance_id != local.instance_id
-    ) or target.channel_index != local.channel_index
 
 
 def prompt_follow_player_name(
@@ -2952,422 +923,6 @@ def show_control_menu(state: dict[str, Any]) -> str:
     return result[0]
 
 
-def find_follow_player(
-    players: Iterable[MemoryObservedPlayer], player_id: str
-) -> MemoryObservedPlayer | None:
-    """Rebind a follow identity after its transient ObjectId changes."""
-    if not player_id:
-        return None
-    return next(
-        (
-            player
-            for player in players
-            if player.player_id == player_id
-            and player.object_id > 0
-            and player.alive
-        ),
-        None,
-    )
-
-
-def follow_stop_distance_world(
-    local_player: MemoryPlayer,
-    followed_player: MemoryObservedPlayer,
-    padding_world: float,
-) -> float:
-    return (
-        max(0.0, local_player.collider_radius)
-        + max(0.0, followed_player.collider_radius)
-        + max(0.0, padding_world)
-    )
-
-
-def update_follow_rejoin_state(
-    rejoining: bool,
-    *,
-    distance_world: float,
-    stop_distance_world: float,
-    rejoin_distance_world: float,
-) -> bool:
-    """Apply hysteresis: enter far away, leave only at the close stop radius."""
-    if rejoining:
-        return distance_world > max(0.0, stop_distance_world)
-    return distance_world > max(
-        max(0.0, stop_distance_world), max(0.0, rejoin_distance_world)
-    )
-
-
-def select_follow_memory_target(
-    monsters: Iterable[MemoryMonster],
-    followed_player: MemoryObservedPlayer,
-    previous_object_id: int | None,
-    skipped_until: dict[int, float],
-    *,
-    now: float,
-    radius_world: float,
-    blocked_object_ids: set[int] | frozenset[int] = frozenset(),
-) -> tuple[MemoryMonster | None, dict[int, float]]:
-    """Select only enemies inside the followed player's horizontal radius."""
-    active_skips = {
-        object_id: expiry for object_id, expiry in skipped_until.items() if expiry > now
-    }
-    radius = max(0.0, float(radius_world))
-    candidates = [
-        monster
-        for monster in monsters
-        if monster.team == "enemy"
-        and monster.alive
-        and monster.visible
-        and not monster.training_dummy
-        and monster.health_ratio > 0.0
-        and not monster.avoid
-        and monster.object_id not in active_skips
-        and monster.object_id not in blocked_object_ids
-        and horizontal_distance(monster.position, followed_player.position) <= radius
-    ]
-    if previous_object_id is not None:
-        previous = next(
-            (monster for monster in candidates if monster.object_id == previous_object_id),
-            None,
-        )
-        if previous is not None:
-            return previous, active_skips
-    return (
-        min(
-            candidates,
-            key=lambda monster: (
-                horizontal_distance(monster.position, followed_player.position),
-                monster.object_id,
-            ),
-            default=None,
-        ),
-        active_skips,
-    )
-
-
-def reset_combat_watchdog(
-    state: CombatWatchdogState,
-    target: MemoryMonster | None,
-    now: float,
-) -> None:
-    state.target_object_id = target.object_id if target is not None else None
-    state.best_health_ratio = target.health_ratio if target is not None else 1.0
-    state.last_progress_at = now
-    state.was_in_range = False
-    state.reengage_attempted = False
-    state.reposition_started_at = None
-
-
-def pause_combat_watchdog(state: CombatWatchdogState, now: float) -> None:
-    state.last_progress_at = now
-    state.was_in_range = False
-    state.reengage_attempted = False
-    state.reposition_started_at = None
-
-
-def update_combat_watchdog(
-    state: CombatWatchdogState,
-    target: MemoryMonster,
-    *,
-    arrived: bool,
-    now: float,
-    enabled: bool,
-    config: BotConfig,
-) -> str:
-    if state.target_object_id != target.object_id:
-        reset_combat_watchdog(state, target, now)
-
-    epsilon = max(0.000001, config.combat_health_progress_epsilon)
-    if target.health_ratio <= state.best_health_ratio - epsilon:
-        state.best_health_ratio = target.health_ratio
-        state.last_progress_at = now
-        state.reengage_attempted = False
-        state.reposition_started_at = None
-        state.was_in_range = arrived
-        return "progress"
-
-    if not enabled:
-        state.last_progress_at = now
-        state.was_in_range = arrived
-        state.reengage_attempted = False
-        state.reposition_started_at = None
-        return "preview"
-
-    if state.reposition_started_at is not None:
-        return "reengage"
-
-    if not arrived:
-        state.last_progress_at = now
-        state.was_in_range = False
-        return "chase"
-
-    if not state.was_in_range:
-        state.last_progress_at = now
-        state.was_in_range = True
-        return "attack"
-
-    if now - state.last_progress_at < max(0.1, config.combat_no_progress_sec):
-        return "attack"
-
-    if not state.reengage_attempted:
-        state.reengage_attempted = True
-        state.reposition_started_at = now
-        state.was_in_range = False
-        return "stalled"
-    return "block"
-
-
-def combat_reengage_keys(
-    elapsed_ms: float,
-    side: str,
-    config: BotConfig,
-) -> tuple[str, ...] | None:
-    if elapsed_ms < max(0, config.combat_reengage_back_ms):
-        return ("s",)
-    elapsed_ms -= max(0, config.combat_reengage_back_ms)
-    if elapsed_ms < max(0, config.combat_reengage_side_ms):
-        return (side,)
-    return None
-
-
-def finish_combat_reengage(state: CombatWatchdogState, now: float) -> None:
-    state.reposition_started_at = None
-    state.last_progress_at = now
-    state.was_in_range = False
-
-
-def refresh_combat_blacklist(
-    blocked_object_ids: set[int],
-    absent_since: dict[int, float],
-    present_object_ids: set[int],
-    *,
-    now: float,
-    absence_reset_sec: float,
-) -> None:
-    reset_after = max(0.1, absence_reset_sec)
-    for object_id in tuple(blocked_object_ids):
-        if object_id in present_object_ids:
-            absent_since.pop(object_id, None)
-            continue
-        missing_at = absent_since.setdefault(object_id, now)
-        if now - missing_at >= reset_after:
-            blocked_object_ids.discard(object_id)
-            absent_since.pop(object_id, None)
-
-
-def request_path_matches(
-    path: MemoryPath,
-    request_id: int,
-    target_object_id: int,
-    *,
-    target_kind: str = "monster",
-) -> bool:
-    return (
-        path.request_id == request_id
-        and path.target_kind == target_kind
-        and path.target_object_id == target_object_id
-        and path.status == "complete"
-        and len(path.corners) >= 1
-    )
-
-
-def select_path_waypoint(
-    player_position: tuple[float, float, float],
-    corners: Iterable[tuple[float, float, float]],
-    tolerance_world: float,
-) -> tuple[float, float, float] | None:
-    points = tuple(corners)
-    if not points:
-        return None
-    tolerance = max(0.05, tolerance_world)
-    for point in points:
-        if horizontal_distance(player_position, point) > tolerance:
-            return point
-    return points[-1]
-
-
-def _normalize2(vector: tuple[float, float]) -> tuple[float, float] | None:
-    length = math.hypot(*vector)
-    if length < 0.01:
-        return None
-    return vector[0] / length, vector[1] / length
-
-
-def movement_world_for_keys(
-    keys: Iterable[str], player: MemoryPlayer | None
-) -> tuple[int, int, int]:
-    """Convert camera-relative WASD into the world-space Vector3Int sent by the game."""
-    if player is None:
-        return (0, 0, 0)
-    key_set = set(keys)
-    horizontal = int("d" in key_set) - int("a" in key_set)
-    forward_amount = int("w" in key_set) - int("s" in key_set)
-    forward = _normalize2(player.camera_forward_xz)
-    right = _normalize2(player.camera_right_xz)
-    if forward is None or right is None:
-        return (0, 0, 0)
-
-    world_x = forward_amount * forward[0] + horizontal * right[0]
-    world_z = forward_amount * forward[1] + horizontal * right[1]
-
-    def discrete(value: float) -> int:
-        if value > 0.25:
-            return 1
-        if value < -0.25:
-            return -1
-        return 0
-
-    return (discrete(world_x), 0, discrete(world_z))
-
-
-def movement_keys_for_world_waypoint(
-    player: MemoryPlayer,
-    waypoint: tuple[float, float, float],
-    config: BotConfig,
-) -> tuple[str, ...]:
-    desired = _normalize2(
-        (waypoint[0] - player.position[0], waypoint[2] - player.position[2])
-    )
-    forward = _normalize2(player.camera_forward_xz)
-    right = _normalize2(player.camera_right_xz)
-    if desired is None or forward is None or right is None:
-        return ()
-    forward_amount = desired[0] * forward[0] + desired[1] * forward[1]
-    right_amount = desired[0] * right[0] + desired[1] * right[1]
-    threshold = max(0.0, min(0.95, config.axis_deadzone_ratio)) * max(
-        abs(forward_amount), abs(right_amount), 0.01
-    )
-    keys: list[str] = []
-    if forward_amount > threshold:
-        keys.append("w")
-    elif forward_amount < -threshold:
-        keys.append("s")
-    if right_amount > threshold:
-        keys.append("d")
-    elif right_amount < -threshold:
-        keys.append("a")
-    return tuple(keys)
-
-
-def arrival_radius(player: MemoryPlayer, target: MemoryMonster, config: BotConfig) -> float:
-    return max(
-        0.25,
-        player.collider_radius
-        + target.collider_radius
-        + max(0.0, config.arrival_padding_world),
-    )
-
-
-def map_exit_avoidance_radius(
-    player: MemoryPlayer,
-    map_exit: MemoryMapExit,
-    padding_world: float,
-) -> float:
-    """Return the F8 keep-out radius around one automatic map exit."""
-    return max(
-        0.25,
-        player.collider_radius
-        + map_exit.interaction_range
-        + max(0.0, padding_world),
-    )
-
-
-def point_inside_map_exit_keepout(
-    player: MemoryPlayer,
-    point: tuple[float, float, float],
-    map_exits: Iterable[MemoryMapExit],
-    padding_world: float,
-) -> MemoryMapExit | None:
-    for map_exit in map_exits:
-        if horizontal_distance(point, map_exit.position) < map_exit_avoidance_radius(
-            player, map_exit, padding_world
-        ):
-            return map_exit
-    return None
-
-
-def _horizontal_segment_distance(
-    point: tuple[float, float, float],
-    start: tuple[float, float, float],
-    end: tuple[float, float, float],
-) -> float:
-    segment_x = end[0] - start[0]
-    segment_z = end[2] - start[2]
-    length_squared = segment_x * segment_x + segment_z * segment_z
-    if length_squared <= 1e-9:
-        return horizontal_distance(point, start)
-    projected = (
-        (point[0] - start[0]) * segment_x
-        + (point[2] - start[2]) * segment_z
-    ) / length_squared
-    projected = max(0.0, min(1.0, projected))
-    closest = (
-        start[0] + segment_x * projected,
-        start[1],
-        start[2] + segment_z * projected,
-    )
-    return horizontal_distance(point, closest)
-
-
-def path_enters_map_exit_keepout(
-    player: MemoryPlayer,
-    corners: Iterable[tuple[float, float, float]],
-    map_exits: Iterable[MemoryMapExit],
-    padding_world: float,
-) -> MemoryMapExit | None:
-    """Find an exit whose keep-out circle would be entered by an F8 path.
-
-    When the player is already inside a circle, outward-only path segments are
-    allowed until the path leaves it.  This prevents the guard from trapping a
-    character who starts near an exit while still rejecting paths that approach
-    or re-enter the automatic transition area.
-    """
-    points = [player.position]
-    for corner in corners:
-        if horizontal_distance(points[-1], corner) > 0.01:
-            points.append(corner)
-    if len(points) < 2:
-        return None
-
-    for map_exit in map_exits:
-        radius = map_exit_avoidance_radius(player, map_exit, padding_world)
-        inside = horizontal_distance(player.position, map_exit.position) < radius
-        for start, end in zip(points, points[1:]):
-            start_distance = horizontal_distance(start, map_exit.position)
-            end_distance = horizontal_distance(end, map_exit.position)
-            if inside:
-                if end_distance <= start_distance + 0.01:
-                    return map_exit
-                if end_distance >= radius:
-                    inside = False
-                continue
-            if _horizontal_segment_distance(map_exit.position, start, end) < radius:
-                return map_exit
-    return None
-
-
-def unstuck_keys(elapsed_ms: float, side: str, config: BotConfig) -> tuple[str, ...] | None:
-    opposite = "d" if side == "a" else "a"
-    if elapsed_ms < config.unstuck_back_ms:
-        return ("s",)
-    elapsed_ms -= config.unstuck_back_ms
-    if elapsed_ms < config.unstuck_back_diagonal_ms:
-        return ("s", side)
-    elapsed_ms -= config.unstuck_back_diagonal_ms
-    if elapsed_ms < config.unstuck_side_ms:
-        return (side,)
-    elapsed_ms -= config.unstuck_side_ms
-    if elapsed_ms < config.unstuck_diagonal_ms:
-        return ("w", side)
-    elapsed_ms -= config.unstuck_diagonal_ms
-    if elapsed_ms < config.unstuck_return_ms:
-        return ("w", opposite)
-    elapsed_ms -= config.unstuck_return_ms
-    if elapsed_ms < config.unstuck_forward_ms:
-        return ("w",)
-    return None
-
-
 def list_windows() -> list[tuple[int, str]]:
     windows: list[tuple[int, str]] = []
 
@@ -3506,25 +1061,6 @@ def key_transitions(
     releases = tuple(key for key in reversed(order) if key in held_set - desired_set)
     presses = tuple(key for key in order if key in desired_set - held_set)
     return releases, presses
-
-
-def f8_shift_keys(config: BotConfig) -> tuple[str, ...]:
-    """Return continuously held F8 modifiers selected by the configured job type."""
-    try:
-        return F8_SHIFT_KEYS_BY_JOB_TYPE[config.job_type]
-    except KeyError as error:
-        raise ValueError(
-            "job_type must be 0 (under level 64), 1 (summoner), or 2 (priest)"
-        ) from error
-
-
-def next_priest_shift_tap_at(now: float, config: BotConfig) -> float:
-    """Schedule the next priest Left Shift tap using the configured random range."""
-    interval_ms = random.uniform(
-        config.priest_left_shift_tap_min_interval_ms,
-        config.priest_left_shift_tap_max_interval_ms,
-    )
-    return now + interval_ms / 1000
 
 
 def update_held_keys(
@@ -4028,34 +1564,18 @@ def run_bot(
     channel_switch_request_id = 0
     channel_switch_index = -1
     last_channel_switch_at = -math.inf
+    request_publisher = NavigationRequestPublisher(request_path)
     request_id = 0
     requested_target_kind = "none"
     requested_target_id = 0
-    last_request_bot_active: bool | None = None
-    last_request_movement_keys: tuple[str, ...] = ()
-    last_request_shift_keys: tuple[str, ...] = ()
     pending_summon_action = ""
-    last_request_summon_action = ""
     pending_skill_key_request_id = 0
     pending_skill_key = ""
     pending_skill_key_target_summon = False
-    last_request_skill_key_request_id = 0
-    last_request_skill_key = ""
-    last_request_skill_key_target_summon = False
     pending_loot_interact = 0
     pending_loot_interact_object_id = 0
-    last_request_loot_interact = 0
-    last_request_focus_target_object_id = 0
-    last_request_probe_active: bool | None = None
-    last_request_loot_scan_active: bool | None = None
-    last_request_party_follow_active: bool | None = None
-    last_request_follow_channel_request_id = 0
-    last_request_follow_player_id = ""
-    last_request_channel_switch_request_id = 0
     pending_consumable_use_request_id = 0
     pending_consumable_name = ""
-    last_request_consumable_use_request_id = 0
-    last_request_write_at = -math.inf
     skipped_until: dict[int, float] = {}
     combat_blocked_object_ids: set[int] = set()
     combat_blocked_absent_since: dict[int, float] = {}
@@ -4103,7 +1623,7 @@ def run_bot(
             held_keys,
             desired if send_input and input_allowed else (),
         )
-        request_target(requested_target_id, requested_target_kind)
+        publish_navigation_intent(requested_target_id, requested_target_kind)
 
     def tap_game_key(key: str, hold_ms: int) -> bool:
         """Send one game key only while the latest local-player state is alive."""
@@ -4112,12 +1632,12 @@ def run_bot(
             return False
         if key in HELD_SHIFT_KEYS:
             tapped_shift_keys.add(key)
-            request_target(requested_target_id, requested_target_kind)
+            publish_navigation_intent(requested_target_id, requested_target_kind)
             try:
                 time.sleep(max(0.0, hold_ms / 1000))
             finally:
                 tapped_shift_keys.discard(key)
-                request_target(requested_target_id, requested_target_kind)
+                publish_navigation_intent(requested_target_id, requested_target_kind)
             return True
         summon_action = ""
         if key == config.summon_reanimation_key:
@@ -4129,12 +1649,12 @@ def run_bot(
             # background keypress: Unity ignores PostMessage'd keys for an
             # unfocused window, so the probe fires the bound hotkey in-game.
             pending_summon_action = summon_action
-            request_target(requested_target_id, requested_target_kind)
+            publish_navigation_intent(requested_target_id, requested_target_kind)
             try:
                 time.sleep(max(0.0, hold_ms / 1000))
             finally:
                 pending_summon_action = ""
-                request_target(requested_target_id, requested_target_kind)
+                publish_navigation_intent(requested_target_id, requested_target_kind)
             return True
         post_key_tap(hwnd, key, hold_ms)
         return True
@@ -4154,7 +1674,7 @@ def run_bot(
             return False
         pending_loot_interact += 1
         pending_loot_interact_object_id = int(object_id)
-        request_target(requested_target_id, requested_target_kind)
+        publish_navigation_intent(requested_target_id, requested_target_kind)
         return True
 
     def request_skill_key(key: str, target_summon: bool = False) -> bool:
@@ -4177,28 +1697,14 @@ def run_bot(
         )
         pending_skill_key = normalized
         pending_skill_key_target_summon = bool(target_summon)
-        request_target(requested_target_id, requested_target_kind)
+        publish_navigation_intent(requested_target_id, requested_target_kind)
         return True
 
-    def request_target(
+    def publish_navigation_intent(
         object_id: int, target_kind: str = "monster", *, force: bool = False
     ) -> None:
+        """Translate current mode/input state into one complete probe request."""
         nonlocal request_id, requested_target_kind, requested_target_id
-        nonlocal last_request_bot_active, last_request_probe_active
-        nonlocal last_request_movement_keys
-        nonlocal last_request_shift_keys
-        nonlocal last_request_summon_action
-        nonlocal last_request_skill_key_request_id, last_request_skill_key
-        nonlocal last_request_skill_key_target_summon
-        nonlocal last_request_loot_interact
-        nonlocal last_request_focus_target_object_id
-        nonlocal last_request_loot_scan_active
-        nonlocal last_request_party_follow_active
-        nonlocal last_request_write_at
-        nonlocal last_request_follow_channel_request_id
-        nonlocal last_request_follow_player_id
-        nonlocal last_request_channel_switch_request_id
-        nonlocal last_request_consumable_use_request_id
         write_now = time.monotonic()
         normalized_kind = "none" if object_id <= 0 else target_kind
         party_follow_active = bool(follow_discovery_active or follow_mode)
@@ -4227,46 +1733,9 @@ def run_bot(
         ):
             focus_target_object_id = target.object_id
             focus_target_world = target.position
-        same_request_without_movement = (
-            object_id == requested_target_id
-            and normalized_kind == requested_target_kind
-            and probe_active == last_request_probe_active
-            and loot_scan_active == last_request_loot_scan_active
-            and party_follow_active == last_request_party_follow_active
-            and bot_active == last_request_bot_active
-            and follow_channel_request_id
-            == last_request_follow_channel_request_id
-            and follow_player_id == last_request_follow_player_id
-            and channel_switch_request_id
-            == last_request_channel_switch_request_id
-            and pending_consumable_use_request_id
-            == last_request_consumable_use_request_id
-            and pending_skill_key_request_id
-            == last_request_skill_key_request_id
-            and pending_skill_key == last_request_skill_key
-            and pending_skill_key_target_summon
-            == last_request_skill_key_target_summon
-            and focus_target_object_id == last_request_focus_target_object_id
-        )
-        same_target = (
-            same_request_without_movement
-            and movement_keys == last_request_movement_keys
-            and shift_keys == last_request_shift_keys
-            and pending_summon_action == last_request_summon_action
-            and pending_loot_interact == last_request_loot_interact
-        )
-        if not force and same_target and write_now - last_request_write_at < 0.5:
-            return
-        if not same_target:
-            if not same_request_without_movement:
-                request_id += 1
-            requested_target_id = object_id
-            requested_target_kind = normalized_kind
-        write_navigation_request(
-            request_path,
-            request_id,
-            object_id,
-            target_kind=normalized_kind,
+        request_publisher.publish(
+            object_id, normalized_kind, now=write_now, force=force,
+            writer=write_navigation_request,
             probe_active=probe_active,
             loot_scan_active=loot_scan_active,
             party_follow_active=party_follow_active,
@@ -4303,23 +1772,10 @@ def run_bot(
             loot_interact=pending_loot_interact,
             loot_interact_object_id=pending_loot_interact_object_id,
         )
-        last_request_probe_active = probe_active
-        last_request_loot_scan_active = loot_scan_active
-        last_request_party_follow_active = party_follow_active
-        last_request_bot_active = bot_active
-        last_request_movement_keys = movement_keys
-        last_request_shift_keys = shift_keys
-        last_request_summon_action = pending_summon_action
-        last_request_skill_key_request_id = pending_skill_key_request_id
-        last_request_skill_key = pending_skill_key
-        last_request_skill_key_target_summon = pending_skill_key_target_summon
-        last_request_loot_interact = pending_loot_interact
-        last_request_focus_target_object_id = focus_target_object_id
-        last_request_follow_channel_request_id = follow_channel_request_id
-        last_request_follow_player_id = follow_player_id
-        last_request_channel_switch_request_id = channel_switch_request_id
-        last_request_consumable_use_request_id = pending_consumable_use_request_id
-        last_request_write_at = write_now
+        request_id = request_publisher.request_id
+        requested_target_id = request_publisher.target_object_id
+        requested_target_kind = request_publisher.target_kind
+
 
     def request_consumable_use(name: str) -> int:
         nonlocal pending_consumable_use_request_id, pending_consumable_name
@@ -4328,7 +1784,7 @@ def run_bot(
             int(time.time() * 1000),
         )
         pending_consumable_name = str(name).strip()
-        request_target(0)
+        publish_navigation_intent(0)
         return pending_consumable_use_request_id
 
     def request_channel_switch(index: int) -> None:
@@ -4340,7 +1796,7 @@ def run_bot(
             channel_switch_request_id + 1, int(time.time() * 1000)
         )
         last_channel_switch_at = time.monotonic()
-        request_target(requested_target_id, requested_target_kind)
+        publish_navigation_intent(requested_target_id, requested_target_kind)
 
     def update_summon_mount_keys(player: MemoryPlayer, now: float) -> bool:
         enabled = summon_mount_blocks_navigation(
@@ -4398,12 +1854,13 @@ def run_bot(
         if refresh_wallet and navigation_earnings.tracking_active:
             set_keys(())
             requested_at_ms = int(time.time() * 1000)
-            request_target(0, force=True)
+            publish_navigation_intent(0, force=True)
             try:
                 snapshot = wait_for_wallet_snapshot(
                     state_path,
                     config.memory_snapshot_timeout_ms,
                     after_timestamp_ms=requested_at_ms,
+                    snapshot_reader=load_memory_snapshot,
                     wait_timeout_ms=1000,
                     avoid_boss=config.avoid_boss and mode != 3,
                 )
@@ -4428,7 +1885,7 @@ def run_bot(
         set_keys(())
         finalize_navigation_statistics(refresh_wallet=True)
         active = False
-        request_target(0, force=True)
+        publish_navigation_intent(0, force=True)
         announce(
             "MODE 3 SAFE PAUSE - " + boss_farm.fault,
             force=True,
@@ -4612,7 +2069,7 @@ def run_bot(
     equipment_filter_controller.start()
 
     try:
-        request_target(0)
+        publish_navigation_intent(0)
         while win32gui.IsWindow(hwnd):
             now = time.monotonic()
             # F8 is the only hotkey. Its rising edge opens the control menu,
@@ -4750,7 +2207,7 @@ def run_bot(
                         reset_summon_mount_key_state(summon_mount_keys)
                         reset_summoner_check_state(summoner_check_state)
                     reset_combat_watchdog(combat_watchdog, None, now)
-                    request_target(0)
+                    publish_navigation_intent(0)
                     set_keys(())
                     announce(
                         "選單：純跟隨模式關閉；一般導航"
@@ -4771,13 +2228,14 @@ def run_bot(
                     reset_combat_watchdog(combat_watchdog, None, now)
                     follow_discovery_active = True
                     discovery_requested_at_ms = int(time.time() * 1000)
-                    request_target(0)
+                    publish_navigation_intent(0)
                     set_keys(())
                     try:
                         selection_snapshot = wait_for_party_snapshot(
                             state_path,
                             config.memory_snapshot_timeout_ms,
                             after_timestamp_ms=discovery_requested_at_ms,
+                            snapshot_reader=load_memory_snapshot,
                         )
                     except SnapshotUnavailable as error:
                         selection_snapshot = None
@@ -4861,7 +2319,7 @@ def run_bot(
                                 force=True,
                             )
                     follow_discovery_active = False
-                    request_target(0)
+                    publish_navigation_intent(0)
                     if not follow_mode and send_input and active:
                         resume_navigation_earnings(
                             navigation_earnings, now=time.monotonic()
@@ -4891,7 +2349,7 @@ def run_bot(
                     loot_clear_frames = 0
                     loot_skipped_until.clear()
                     reset_loot_chase(loot_chase, now=now)
-                    request_target(0)
+                    publish_navigation_intent(0)
                     set_keys(())
                     announce(
                         f"選單：最低拾取品質已設為 {selected_rarity} 以上。",
@@ -4929,7 +2387,7 @@ def run_bot(
                     loot_candidate_frames = 0
                     reset_loot_chase(loot_chase, now=now)
                     reset_combat_watchdog(combat_watchdog, None, now)
-                    request_target(0)
+                    publish_navigation_intent(0)
                     set_keys(())
                     announce(
                         f"選單：一般導航{'開啟' if active else '關閉'}。",
@@ -4975,7 +2433,7 @@ def run_bot(
                 loot_candidate_frames = 0
                 reset_loot_chase(loot_chase, now=now)
                 reset_combat_watchdog(combat_watchdog, None, now)
-                request_target(0)
+                publish_navigation_intent(0)
                 set_keys(())
                 status = f"SAFE STOP - {error}"
                 announce(status, dedupe_key=snapshot_error_log_key(error))
@@ -5002,7 +2460,7 @@ def run_bot(
                 loot_clear_frames = 0
                 reset_loot_chase(loot_chase, now=now)
                 reset_combat_watchdog(combat_watchdog, None, now)
-                request_target(0)
+                publish_navigation_intent(0)
                 set_keys(())
                 status = "PLAYER DEAD - ALL INPUT RELEASED"
                 announce(status, dedupe_key="player_dead")
@@ -5045,7 +2503,7 @@ def run_bot(
                 combat_blocked_object_ids.clear()
                 combat_blocked_absent_since.clear()
                 reset_combat_watchdog(combat_watchdog, None, now)
-                request_target(0)
+                publish_navigation_intent(0)
                 progress_anchor = snapshot.player.position
                 progress_started_at = now
                 unstuck_started_at = None
@@ -5151,7 +2609,7 @@ def run_bot(
                         f"follow_same_channel_wait:{follow_player_id}:"
                         f"{followed_party_member.channel_index}"
                     )
-                request_target(0)
+                publish_navigation_intent(0)
                 set_keys(())
                 announce(status, dedupe_key=dedupe_key)
                 if config.debug_window:
@@ -5181,7 +2639,7 @@ def run_bot(
                 set_keys(())
                 # Clear the enemy focus as well as movement: a later probe
                 # update must not replace GuardianBond's target mid-cast.
-                request_target(0)
+                publish_navigation_intent(0)
             if advance_summoner_checks(
                 summoner_check_state,
                 config,
@@ -5212,7 +2670,7 @@ def run_bot(
             # Summoner mount maintenance gates either general F8 navigation or
             # independent F2 following. Keep the probe heartbeat fresh until
             # mounting is confirmed, even without a current movement target.
-            request_target(requested_target_id, requested_target_kind)
+            publish_navigation_intent(requested_target_id, requested_target_kind)
             if update_summon_mount_keys(snapshot.player, now):
                 pause_combat_watchdog(combat_watchdog, now)
                 chase_started_at = now
@@ -5255,7 +2713,7 @@ def run_bot(
                 reset_combat_watchdog(combat_watchdog, None, now)
 
                 if followed_player is None:
-                    request_target(0)
+                    publish_navigation_intent(0)
                     set_keys(())
                     status = (
                         "FOLLOW LOST - WAITING FOR "
@@ -5282,7 +2740,7 @@ def run_bot(
                     followed_player,
                     config.follow_player_stop_padding_world,
                 )
-                request_target(followed_player.object_id, "player")
+                publish_navigation_intent(followed_player.object_id, "player")
                 safe_follow_path = request_path_matches(
                     snapshot.path,
                     request_id,
@@ -5369,7 +2827,7 @@ def run_bot(
                 loot_clear_frames = 0
                 reset_loot_chase(loot_chase, now=now)
                 reset_combat_watchdog(combat_watchdog, None, now)
-                request_target(0)
+                publish_navigation_intent(0)
                 set_keys(())
                 status = "SAFE STOP - MAP EXIT DATA UNAVAILABLE"
                 announce(
@@ -5439,7 +2897,7 @@ def run_bot(
                     missing_for = now - boss_farm.boss_missing_since
                     if missing_for < boss_death_confirm_sec:
                         target = None
-                        request_target(0)
+                        publish_navigation_intent(0)
                         set_keys(())
                         status = (
                             f"MODE 3 BOSS MISSING - CONFIRMING "
@@ -5466,7 +2924,7 @@ def run_bot(
                     elif matching_boss is None:
                         if not send_input:
                             target = None
-                            request_target(0)
+                            publish_navigation_intent(0)
                             set_keys(())
                             status = (
                                 f"MODE 3 PREVIEW - WOULD USE "
@@ -5483,7 +2941,7 @@ def run_bot(
                         # boss_use_key_release_settle_sec for that to reach the game
                         # before firing the use.
                         target = None
-                        request_target(0)
+                        publish_navigation_intent(0)
                         set_keys(())
                         if boss_farm.key_release_started_at is None:
                             boss_farm.key_release_started_at = now
@@ -5538,7 +2996,7 @@ def run_bot(
                         time.sleep(max(0.05, config.target_lost_wait_ms / 1000))
                         continue
                     target = None
-                    request_target(0)
+                    publish_navigation_intent(0)
                     set_keys(())
                     status = (
                         f"MODE 3 WAIT BOSS - {boss_name} "
@@ -5553,7 +3011,7 @@ def run_bot(
                     if boss_legendary_target is None and not memory_loot_active:
                         if now < boss_farm.loot_settle_until:
                             target = None
-                            request_target(0)
+                            publish_navigation_intent(0)
                             set_keys(())
                             remaining = boss_farm.loot_settle_until - now
                             status = (
@@ -5567,7 +3025,7 @@ def run_bot(
                             "MODE 3 LOOT CLEAR - 開始下一輪召喚。",
                             force=True,
                         )
-                        request_target(0)
+                        publish_navigation_intent(0)
                         set_keys(())
                         time.sleep(config.loop_delay_ms / 1000)
                         continue
@@ -5714,180 +3172,34 @@ def run_bot(
                     or loot_target.sprite_id
                     or "UNKNOWN"
                 )
-                distance_to_loot = horizontal_distance(
-                    snapshot.player.position, loot_target.position
+                interaction = plan_loot_interaction(
+                    loot_chase, snapshot.player, loot_target, config,
+                    now=now, confirmed_frames=loot_candidate_frames,
+                    last_interact_at=last_loot_interact, send_input=send_input,
+                    in_exit_keepout=player_map_exit is not None,
                 )
-                loot_in_range = loot_is_within_pickup_range(
-                    snapshot.player,
-                    loot_target,
-                    range_padding_world=config.memory_loot_range_padding_world,
-                    max_distance_world=config.memory_loot_max_distance_world,
-                ) and player_map_exit is None
-                loot_hold_in_range = (
-                    loot_chase.release_started_at is not None
-                    and distance_to_loot
-                    <= loot_pickup_hold_radius(
-                        snapshot.player,
-                        loot_target,
-                        range_padding_world=(
-                            config.memory_loot_range_padding_world
-                        ),
-                        hysteresis_world=(
-                            config.memory_loot_pickup_hysteresis_world
-                        ),
-                        max_distance_world=(
-                            config.memory_loot_max_distance_world
-                        ),
-                    )
-                    and player_map_exit is None
-                )
-                if loot_candidate_frames < max(1, config.memory_loot_confirm_frames):
-                    request_target(0)
+                if interaction.phase in {"confirm", "stop"}:
+                    publish_navigation_intent(0)
                     desired_loot_keys: tuple[str, ...] = ()
                     set_keys(())
                     status = (
                         f"MEMORY LOOT CANDIDATE {loot_target.object_id} "
                         f"{loot_target.rarity} {loot_label}"
                     )
-                elif not (loot_in_range or loot_hold_in_range):
-                    # Re-entering pickup range must always start with a fresh
-                    # neutral-input phase, even if this same loot was briefly
-                    # in range on an earlier frame.
-                    loot_chase.release_started_at = None
-                    request_target(loot_target.object_id, "loot")
-                    safe_loot_path = request_path_matches(
-                        snapshot.path,
-                        request_id,
-                        loot_target.object_id,
-                        target_kind="loot",
+                elif interaction.phase == "chase":
+                    publish_navigation_intent(loot_target.object_id, "loot")
+                    approach = plan_loot_approach(
+                        snapshot, loot_target, loot_chase, config,
+                        request_id=request_id, now=now, send_input=send_input,
+                        loot_rule_label=loot_rule_label,
                     )
-                    loot_keys: tuple[str, ...] = ()
-                    failure_reason: str | None = None
-                    if safe_loot_path and path_enters_map_exit_keepout(
-                        snapshot.player,
-                        snapshot.path.corners,
-                        snapshot.map_exits,
-                        config.map_exit_avoidance_padding_world,
-                    ) is not None:
-                        safe_loot_path = False
-                        failure_reason = "map_exit"
-                    if safe_loot_path:
-                        loot_chase.path_invalid_since = None
-                        waypoint = select_path_waypoint(
-                            snapshot.player.position,
-                            snapshot.path.corners,
-                            config.path_waypoint_tolerance_world,
-                        )
-                        loot_keys = (
-                            movement_keys_for_world_waypoint(
-                                snapshot.player, waypoint, config
-                            )
-                            if waypoint is not None
-                            else ()
-                        )
-                        status = (
-                            f"{'OWN LOOT CHASE' if send_input else 'WOULD CHASE OWN LOOT'} "
-                            f"{loot_target.object_id} D={distance_to_loot:.2f} "
-                            f"{'KEYS' if send_input else 'WOULD'}="
-                            f"{''.join(loot_keys).upper() or '-'}"
-                        )
-
-                        if send_input and loot_keys and loot_chase.unstuck_started_at is None:
-                            if loot_chase.progress_anchor is None:
-                                loot_chase.progress_anchor = snapshot.player.position
-                                loot_chase.progress_started_at = now
-                            moved = horizontal_distance(
-                                snapshot.player.position, loot_chase.progress_anchor
-                            )
-                            if moved >= config.stuck_position_epsilon_world:
-                                loot_chase.progress_anchor = snapshot.player.position
-                                loot_chase.progress_started_at = now
-                            elif now - loot_chase.progress_started_at >= config.stuck_timeout_sec:
-                                loot_chase.unstuck_started_at = now
-                                loot_chase.unstuck_anchor = snapshot.player.position
-                                loot_chase.unstuck_attempt = 1
-                                announce(
-                                    f"{loot_rule_label} {loot_target.object_id} "
-                                    "導航未前進，開始脫困。",
-                                    force=True,
-                                )
-
-                        if send_input and loot_chase.unstuck_started_at is not None:
-                            maneuver = unstuck_keys(
-                                (now - loot_chase.unstuck_started_at) * 1000,
-                                loot_chase.unstuck_side,
-                                config,
-                            )
-                            if maneuver is not None:
-                                loot_keys = maneuver
-                                status = (
-                                    f"LOOT UNSTUCK {loot_target.object_id} "
-                                    f"{loot_chase.unstuck_attempt} "
-                                    f"{''.join(loot_keys).upper()}"
-                                )
-                            else:
-                                moved = (
-                                    horizontal_distance(
-                                        snapshot.player.position,
-                                        loot_chase.unstuck_anchor,
-                                    )
-                                    if loot_chase.unstuck_anchor is not None
-                                    else 0.0
-                                )
-                                if moved >= config.unstuck_min_success_world:
-                                    announce(
-                                        f"{loot_rule_label}導航脫困成功，"
-                                        f"世界位移 {moved:.2f}。",
-                                        force=True,
-                                    )
-                                    loot_chase.unstuck_started_at = None
-                                    loot_chase.unstuck_anchor = None
-                                    loot_chase.unstuck_attempt = 0
-                                    loot_chase.unstuck_side = (
-                                        "d" if loot_chase.unstuck_side == "a" else "a"
-                                    )
-                                    loot_chase.progress_anchor = snapshot.player.position
-                                    loot_chase.progress_started_at = now
-                                elif loot_chase.unstuck_attempt < max(
-                                    1, config.unstuck_max_attempts
-                                ):
-                                    loot_chase.unstuck_attempt += 1
-                                    loot_chase.unstuck_side = (
-                                        "d" if loot_chase.unstuck_side == "a" else "a"
-                                    )
-                                    loot_chase.unstuck_started_at = now
-                                    loot_chase.unstuck_anchor = snapshot.player.position
-                                    loot_keys = ("s",)
-                                else:
-                                    failure_reason = "unstuck"
-                    else:
-                        loot_chase.path_invalid_since = (
-                            loot_chase.path_invalid_since or now
-                        )
-                        status = (
-                            f"LOOT WAIT PATH request={request_id} "
-                            f"response={snapshot.path.request_id} "
-                            f"kind={snapshot.path.target_kind} "
-                            f"status={snapshot.path.status}"
-                        )
-                        if (
-                            snapshot.path.request_id == request_id
-                            and snapshot.path.target_object_id == loot_target.object_id
-                            and snapshot.path.target_kind != "loot"
-                        ):
-                            announce(
-                                f"{loot_rule_label}導航需要新版探針；"
-                                "請安裝新版 DLL 並重啟遊戲。",
-                                dedupe_key="loot_target_kind_probe_upgrade_required",
-                            )
-
-                    failure_reason = failure_reason or loot_chase_failure_reason(
-                        loot_chase,
-                        now=now,
-                        path_invalid_grace_sec=config.path_invalid_grace_sec,
-                        chase_timeout_sec=config.memory_loot_chase_timeout_sec,
-                        enforce_timeout=send_input,
-                    )
+                    loot_keys = approach.movement_keys
+                    safe_loot_path = approach.path_ready
+                    failure_reason = approach.failure_reason
+                    status = approach.status
+                    for notice in approach.notices:
+                        announce(notice.message, force=notice.force,
+                                 dedupe_key=notice.dedupe_key)
                     if failure_reason is not None:
                         if mode == 3:
                             pause_boss_farm(
@@ -5916,7 +3228,7 @@ def run_bot(
                         loot_candidate_object_id = None
                         loot_candidate_frames = 0
                         reset_loot_chase(loot_chase, now=now)
-                        request_target(0)
+                        publish_navigation_intent(0)
                         set_keys(())
                         if config.debug_window:
                             cv2.imshow(
@@ -5963,37 +3275,29 @@ def run_bot(
                     time.sleep(config.loop_delay_ms / 1000)
                     continue
                 else:
-                    request_target(0)
+                    publish_navigation_intent(0)
                     desired_loot_keys = ()
                     set_keys(desired_loot_keys)
-                    if loot_chase.release_started_at is None:
-                        loot_chase.release_started_at = now
+                    if interaction.started_release:
                         announce(
                             f"拾取 {loot_target.object_id} 前先放開所有移動鍵與 Shift。",
                             force=True,
                         )
-                    release_elapsed = now - loot_chase.release_started_at
-                    release_settle = (
-                        config.memory_loot_release_settle_ms / 1000
-                    )
-                    if release_elapsed < release_settle:
+                    if interaction.phase == "release":
                         status = (
                             f"LOOT RELEASE ALL KEYS {loot_target.object_id} "
-                            f"WAIT={max(0.0, release_settle - release_elapsed):.2f}s"
+                            f"WAIT={interaction.wait_seconds:.2f}s"
                         )
                     else:
-                        action = "LOOT PRESS V" if send_input else "WOULD PRESS V"
+                        action = "LOOT PICK UP TARGET" if send_input else "WOULD PICK UP TARGET"
                         status = (
                             f"{loot_ownership_label(loot_target)} {action} "
                             f"{loot_target.object_id} "
                             f"{loot_target.rarity} {loot_label}"
                         )
-                        if (
-                            now - last_loot_interact
-                            >= config.memory_loot_interact_cooldown_ms / 1000
-                        ):
-                            if send_input:
-                                request_loot_pickup(loot_target.object_id)
+                        if interaction.interaction_due:
+                            if interaction.pickup_object_id is not None:
+                                request_loot_pickup(interaction.pickup_object_id)
                             last_loot_interact = now
                             announce(
                                 f"內存掉落物：{loot_target.object_id} "
@@ -6031,7 +3335,7 @@ def run_bot(
                     unstuck_started_at = None
                     unstuck_anchor = None
                     unstuck_attempt = 0
-                    request_target(0)
+                    publish_navigation_intent(0)
                     set_keys(())
                     status = "LOOT CLEAR - CONFIRMING; NAVIGATION PAUSED"
                     time.sleep(config.loop_delay_ms / 1000)
@@ -6072,7 +3376,7 @@ def run_bot(
                     ):
                         reset_combat_watchdog(combat_watchdog, None, now)
                         target = None
-                        request_target(0)
+                        publish_navigation_intent(0)
                         set_keys(())
                         status = "BOSS CHANNEL SWITCH - 等待新頻道載入"
                         announce(status, dedupe_key="boss_channel_settle")
@@ -6083,7 +3387,7 @@ def run_bot(
                     ) % snapshot.channel_count
                     reset_combat_watchdog(combat_watchdog, None, now)
                     target = None
-                    request_target(0)
+                    publish_navigation_intent(0)
                     set_keys(())
                     request_channel_switch(target_index)
                     status = (
@@ -6115,7 +3419,7 @@ def run_bot(
                         )
                         reset_combat_watchdog(combat_watchdog, None, now)
                         target = None
-                        request_target(0)
+                        publish_navigation_intent(0)
                         set_keys(flee_keys)
                         status = (
                             f"BOSS FLEE - 遠離首領 {boss.object_id} "
@@ -6183,7 +3487,7 @@ def run_bot(
                     )
             if target is None:
                 reset_combat_watchdog(combat_watchdog, None, now)
-                request_target(0)
+                publish_navigation_intent(0)
                 set_keys(())
                 status = (
                     f"NO AVAILABLE ENEMY - COMBAT BLOCKED "
@@ -6203,7 +3507,7 @@ def run_bot(
 
             # Refresh the same request id so the probe can detect a dead Python
             # process while continuously recomputing a moving target's path.
-            request_target(target.object_id)
+            publish_navigation_intent(target.object_id)
             if target.object_id != previous_target_id:
                 mouse_click_completed_for_target = False
                 priest_shift_next_tap_at = -math.inf
@@ -6250,7 +3554,7 @@ def run_bot(
                 )
                 target = None
                 reset_combat_watchdog(combat_watchdog, None, now)
-                request_target(0)
+                publish_navigation_intent(0)
                 set_keys(())
                 status = (
                     f"MAP EXIT AVOID {blocked_target.object_id} "
@@ -6335,7 +3639,7 @@ def run_bot(
                 )
                 target = None
                 reset_combat_watchdog(combat_watchdog, None, now)
-                request_target(0)
+                publish_navigation_intent(0)
                 handoff_keys = f8_shift_keys(config)
                 set_keys(handoff_keys)
                 if config.debug_window:
@@ -6385,7 +3689,7 @@ def run_bot(
                 announce(status, force=True)
                 target = None
                 reset_combat_watchdog(combat_watchdog, None, now)
-                request_target(0)
+                publish_navigation_intent(0)
                 set_keys(())
                 if config.debug_window:
                     cv2.imshow(
@@ -6478,7 +3782,7 @@ def run_bot(
                     )
                     target = None
                     reset_combat_watchdog(combat_watchdog, None, now)
-                    request_target(0)
+                    publish_navigation_intent(0)
                 if config.debug_window:
                     cv2.imshow(
                         RADAR_WINDOW_NAME,
@@ -6526,7 +3830,7 @@ def run_bot(
                     )
                     target = None
                     reset_combat_watchdog(combat_watchdog, None, now)
-                    request_target(0)
+                    publish_navigation_intent(0)
                     keys = ()
                 elif send_input and keys and unstuck_started_at is None:
                     if progress_anchor is None:
@@ -6593,7 +3897,7 @@ def run_bot(
                         )
                         target = None
                         reset_combat_watchdog(combat_watchdog, None, now)
-                        request_target(0)
+                        publish_navigation_intent(0)
                         keys = ()
                         unstuck_started_at = None
                         unstuck_anchor = None

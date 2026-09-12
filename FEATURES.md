@@ -60,7 +60,11 @@
 
 | 檔案 | 責任 |
 | --- | --- |
-| `spiritvale_red_dot_bot.py` | 主程式、控制選單、導航／戰鬥／跟隨／刷王／拾取狀態流程、職業維護、雷達與收入統計 |
+| `spiritvale_red_dot_bot.py` | 主程式、控制選單、模式協調、安全停止、輸入執行與雷達／價格視窗 |
+| `spiritvale_models.py`、`spiritvale_config.py` | 共用快照／功能狀態、設定 schema 與驗證 |
+| `spiritvale_snapshot.py`、`spiritvale_ipc.py` | 快照解析、共享檔案傳輸、請求編號／去重／心跳管理 |
+| `spiritvale_navigation.py`、`spiritvale_loot.py` | 導航計算、戰鬥恢復、掉落物篩選、接近／脫困及拾取決策 |
+| `spiritvale_upkeep.py`、`spiritvale_earnings.py` | 召喚／Buff／坐騎與職業時序、運行時間及收入計算 |
 | `SpiritValePositionProbe.cs` | 遊戲內資料讀取、NavMesh、背景輸入、物品互動、拍賣／背包 IPC、換頻與重登 |
 | `SpiritValeProbeLoader.cs` | 隨遊戲啟動的輕量 Loader，收到新鮮請求後才載入完整探針 |
 | `spiritvale_paths.py` | LocalAppData IPC 路徑、舊路徑相容與探針載入握手 |
@@ -90,6 +94,6 @@
 
 ## 本次驗證
 
-執行 `.venv\Scripts\python.exe -m unittest discover -v`：**218 項測試全部通過**。
+原始功能盤點時，218 項 Python 測試通過。完成本輪模組與拾取重構後，執行 `.venv\Scripts\python.exe -m unittest discover -q`：**241 項測試全部通過**，另有 GuardianBond 13 項及拾取 21 項 C# 行為檢查通過。
 
-本次為程式碼閱讀、設定核對與單元測試；未啟動實際遊戲操作，也未重新建置 DLL 或重跑 C#／實機診斷。既有診斷結果不等同於本次重新驗證。
+本輪已驗證模組匯入、發佈依賴、ZIP 內容與既有 DLL 的 C# 行為；未重新建置探針 DLL、重啟 BOT 或執行實際遊戲操作。重構範圍與後續階段見 [REFACTOR_PLAN.md](REFACTOR_PLAN.md)。

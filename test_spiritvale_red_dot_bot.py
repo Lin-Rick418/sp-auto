@@ -10,6 +10,9 @@ import unittest
 from unittest.mock import patch
 
 import spiritvale_red_dot_bot as bot
+import spiritvale_ipc as ipc
+import spiritvale_loot as loot_policy
+import spiritvale_upkeep as upkeep
 from spiritvale_red_dot_bot import (
     BotConfig,
     CombatWatchdogState,
@@ -977,6 +980,8 @@ class MemoryProtocolTests(unittest.TestCase):
             ) as write_request, patch.object(
                 bot, "request_path_matches", return_value=True
             ), patch.object(
+                loot_policy, "request_path_matches", return_value=True
+            ), patch.object(
                 bot, "update_held_keys", side_effect=capture_keys
             ), patch.object(
                 bot, "move_mouse_to_monster", return_value=True
@@ -1861,7 +1866,7 @@ class MemoryProtocolTests(unittest.TestCase):
     def test_snapshot_read_retries_transient_windows_share_error(self) -> None:
         encoded = json.dumps(valid_raw_state())
         with patch.object(
-            bot,
+            ipc,
             "_read_windows_shared_text",
             side_effect=[PermissionError(13, "sharing violation"), encoded],
         ), patch.object(bot.time, "sleep") as sleep:
@@ -2180,7 +2185,7 @@ class NavigationEarningsTests(unittest.TestCase):
         )
         stale = replace(base, timestamp_ms=99)
         fresh = replace(base, timestamp_ms=100)
-        with patch.object(bot, "load_memory_snapshot", side_effect=[stale, fresh]):
+        with patch.object(ipc, "load_memory_snapshot", side_effect=[stale, fresh]):
             result = wait_for_wallet_snapshot(
                 Path("ignored.json"),
                 750,
@@ -3200,7 +3205,7 @@ class MovementTests(unittest.TestCase):
             priest_left_shift_tap_min_interval_ms=300,
             priest_left_shift_tap_max_interval_ms=1300,
         )
-        with patch.object(bot.random, "uniform", return_value=800) as uniform:
+        with patch.object(upkeep.random, "uniform", return_value=800) as uniform:
             self.assertAlmostEqual(bot.next_priest_shift_tap_at(10.0, config), 10.8)
         uniform.assert_called_once_with(300, 1300)
 
@@ -4604,7 +4609,7 @@ class BossFarmTests(unittest.TestCase):
             normalize_boss_name("Scorpion King <sprite name=fire> Lv.40"),
             "scorpion king",
         )
-        candidate = bot.replace(
+        candidate = replace(
             monster(301, 4.0, 0.0),
             config_id="scorpion-king",
             display_name="Scorpion King <sprite name=fire> Lv.40",
@@ -4613,13 +4618,13 @@ class BossFarmTests(unittest.TestCase):
         self.assertFalse(monster_matches_boss(candidate, "Termite King"))
 
     def test_boss_selector_ignores_other_monsters_and_sticks_to_object_id(self) -> None:
-        normal = bot.replace(
+        normal = replace(
             monster(300, 1.0, 0.0), display_name="Scorpion Lv.35"
         )
-        near = bot.replace(
+        near = replace(
             monster(301, 3.0, 0.0), display_name="Scorpion King Lv.40"
         )
-        far = bot.replace(
+        far = replace(
             monster(302, 8.0, 0.0), config_id="Scorpion King"
         )
         self.assertEqual(

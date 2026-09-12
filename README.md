@@ -1,10 +1,12 @@
 # SpiritVale 內存／NavMesh 導航器
 
+功能總覽見 [FEATURES.md](FEATURES.md)；模組職責、已完成重構與後續規劃見 [REFACTOR_PLAN.md](REFACTOR_PLAN.md)。
+
 這個 Windows 工具由三部分組成：
 
 - BepInEx 輕量 Loader 隨遊戲啟動，只檢查按需載入請求，不掃描場景。
 - BepInEx 探針從遊戲已載入的 IL2CPP 物件讀取玩家、目前地圖分流、敵怪、掉落物與相機方向，並呼叫 Unity `NavMesh.CalculatePath` 計算路徑。
-- Python 導航器讀取路徑，以背景 `PostMessage` 傳送 WASD；進入掉落物拾取範圍後則短按 V。
+- Python 導航器讀取路徑並協調背景移動；進入掉落物拾取範圍後放開移動與技能，再要求探針對指定物件送出互動輸入。
 
 整個程式不擷取或分析遊戲畫面，也不再包含紫色／綠色光柱辨識程式碼。
 
