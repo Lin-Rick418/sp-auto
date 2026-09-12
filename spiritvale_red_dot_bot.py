@@ -78,6 +78,14 @@ F8_SHIFT_KEYS_BY_JOB_TYPE = {
     1: HELD_SHIFT_KEYS,
     2: (),
 }
+# Job types that must finish their class upkeep — every selected summon/buff and
+# any summon-mount step — before ANY navigation input is emitted, including the
+# continuously held Left/Right Shift keys. The main loop releases all keys and
+# skips navigation while these checks are outstanding, and only resumes once a
+# later snapshot confirms everything is present. Only the summoner (1) needs this
+# today; add a future class's job_type here to reuse the same
+# "cast everything first, then navigate" gate with no other code changes.
+NAVIGATION_UPKEEP_JOB_TYPES = frozenset({1})
 SUMMONER_CHECK_ORDER = (
     "SummonSkeleton",
     "SummonAbomination",
@@ -187,8 +195,14 @@ class BotConfig:
     unstuck_max_attempts: int = 2
     memory_loot_min_rarity: str = "Legendary"
     memory_loot_range_padding_world: float = 0.75
+    # Once pickup preparation starts, tolerate small position jitter up to the
+    # loot's real interaction radius instead of restarting the release timer.
+    memory_loot_pickup_hysteresis_world: float = 0.25
     memory_loot_max_distance_world: float = 3.0
     memory_loot_confirm_frames: int = 2
+    # Keep every movement/Shift key released long enough for the probe to
+    # observe a neutral request before sending the targeted loot click.
+    memory_loot_release_settle_ms: int = 50
     memory_loot_interact_cooldown_ms: int = 500
     memory_loot_clear_confirm_frames: int = 5
     memory_loot_chase_timeout_sec: float = 20.0
@@ -424,6 +438,7 @@ class LootChaseState:
     unstuck_anchor: tuple[float, float, float] | None = None
     unstuck_attempt: int = 0
     unstuck_side: str = "a"
+    release_started_at: float | None = None
 
 
 @dataclass
@@ -912,6 +927,8 @@ def load_config(path: Path) -> BotConfig:
         raise ValueError("summon_mount_key is not a supported key")
     config.summoner_checks = normalize_summoner_checks(config.summoner_checks)
     if min(
+        config.memory_loot_release_settle_ms,
+        config.memory_loot_interact_cooldown_ms,
         config.priest_left_shift_tap_hold_ms,
         config.priest_left_shift_tap_min_interval_ms,
         config.priest_left_shift_tap_max_interval_ms,
@@ -1994,7 +2011,7 @@ def summon_mount_blocks_navigation(
 ) -> bool:
     """Pause movement while Python sends the fixed 9 then 0 key sequence."""
     return bool(
-        config.job_type == 1
+        config.job_type in NAVIGATION_UPKEEP_JOB_TYPES
         and send_input
         and active
         and player.mounted_summon_state_available
@@ -2116,10 +2133,9 @@ def summoner_checks_enabled(
     follow_mode: bool,
 ) -> bool:
     return bool(
-        config.job_type == 1
+        config.job_type in NAVIGATION_UPKEEP_JOB_TYPES
         and send_input
-        and active
-        and not follow_mode
+        and (active or follow_mode)
         and player.alive
         and any(
             bool(config.summoner_checks[check_id]["enabled"])
@@ -2417,6 +2433,40 @@ def loot_is_within_pickup_range(
     )
 
 
+def loot_pickup_hold_radius(
+    player: MemoryPlayer,
+    loot: MemoryLoot,
+    *,
+    range_padding_world: float,
+    hysteresis_world: float,
+    max_distance_world: float,
+) -> float:
+    """Return the safe exit radius after pickup preparation has started.
+
+    The entry radius may intentionally sit inside ``InteractionRange`` (for
+    example 0.8 for a 1.0-range drop).  Once all keys are being released, keep
+    the player stopped through small snapshot/movement overshoot, but never
+    widen the hold radius past the server's real interaction range.
+    """
+    entry_radius = loot_pickup_radius(
+        player,
+        loot,
+        range_padding_world=range_padding_world,
+        max_distance_world=max_distance_world,
+    )
+    server_radius = min(
+        max(0.0, max_distance_world),
+        max(0.0, loot.interaction_range),
+    )
+    return max(
+        entry_radius,
+        min(
+            server_radius,
+            entry_radius + max(0.0, hysteresis_world),
+        ),
+    )
+
+
 def reset_loot_chase(
     state: LootChaseState,
     *,
@@ -2432,6 +2482,7 @@ def reset_loot_chase(
     state.unstuck_started_at = None
     state.unstuck_anchor = None
     state.unstuck_attempt = 0
+    state.release_started_at = None
 
 
 def loot_chase_failure_reason(
@@ -2716,6 +2767,66 @@ def show_summoner_check_settings(
         return None
 
 
+def show_loot_rarity_menu(current_rarity: str) -> str | None:
+    """Choose and return the persisted minimum loot rarity; cancel is None."""
+    choices = ("Common", "Rare", "Unique", "Legendary")
+    current_value = loot_minimum_rarity_value(current_rarity)
+    result: list[str | None] = [None]
+    try:
+        import tkinter as tk
+
+        root = tk.Tk()
+        root.title("拾取品質設定")
+        root.attributes("-topmost", True)
+        root.resizable(False, False)
+
+        def _choose(rarity: str) -> None:
+            result[0] = rarity
+            root.destroy()
+
+        tk.Label(
+            root,
+            text="選擇最低拾取品質；會拾取所選品質與更高品質的非裝備物品。",
+            justify="left",
+            padx=12,
+            pady=10,
+        ).pack(fill="x")
+        for rarity in choices:
+            value = LOOT_RARITY_VALUES[rarity.casefold()]
+            label = f"{rarity} 以上"
+            if rarity == "Common":
+                label += "（全部品質）"
+            if value == current_value:
+                label += "　✓ 目前設定"
+            tk.Button(
+                root,
+                text=label,
+                width=36,
+                anchor="w",
+                padx=10,
+                pady=4,
+                command=lambda selected=rarity: _choose(selected),
+            ).pack(fill="x", padx=12, pady=2)
+        tk.Button(
+            root,
+            text="取消（不變更）",
+            width=36,
+            anchor="w",
+            padx=10,
+            pady=4,
+            command=root.destroy,
+        ).pack(fill="x", padx=12, pady=(6, 12))
+        root.protocol("WM_DELETE_WINDOW", root.destroy)
+        root.bind("<Escape>", lambda _event: root.destroy())
+        root.update_idletasks()
+        root.after(0, lambda: (root.lift(), root.focus_force()))
+        root.mainloop()
+    except Exception as error:  # pragma: no cover - GUI failure fallback
+        print(f"拾取品質設定：無法開啟視窗：{error}", flush=True)
+        return None
+    return result[0]
+
+
 def show_control_menu(state: dict[str, Any]) -> str:
     """Show the single-hotkey control menu and return the chosen action code.
 
@@ -2725,7 +2836,7 @@ def show_control_menu(state: dict[str, Any]) -> str:
     user closes the menu without choosing anything.
 
     Recognized codes: "navigation", "summoner_checks", "follow", "loot",
-    "filter", "card", "price_toggle", "reprice", "exit".
+    "loot_rarity", "filter", "card", "price_toggle", "reprice", "exit".
 
     ``state`` carries the current toggles and which optional features are
     available so unavailable buttons are hidden and every button can label its
@@ -2742,6 +2853,9 @@ def show_control_menu(state: dict[str, Any]) -> str:
     follow_mode = bool(state.get("follow_mode"))
     follow_name = str(state.get("follow_player_name") or "")
     loot_enabled = bool(state.get("loot_enabled"))
+    loot_minimum_rarity = str(
+        state.get("loot_minimum_rarity") or "Legendary"
+    )
     price_visible = bool(state.get("price_window_visible"))
 
     entries: list[tuple[str, str]] = []
@@ -2763,6 +2877,12 @@ def show_control_menu(state: dict[str, Any]) -> str:
             label = "純跟隨模式（目前關閉）→ 開啟並輸入名稱"
         entries.append(("follow", label))
     entries.append(("loot", f"內存拾取（目前{_on_off(loot_enabled)}）→ 切換"))
+    entries.append(
+        (
+            "loot_rarity",
+            f"拾取品質（目前 {loot_minimum_rarity} 以上）→ 設定",
+        )
+    )
     entries.append(("filter", "裝備詞條篩選表 → 開啟/關閉編輯器"))
     if state.get("card_available"):
         running = "，監看中" if state.get("card_running") else ""
@@ -3764,6 +3884,10 @@ def run_bot(
         or config.follow_player_rejoin_distance_world < 0
     ):
         raise ValueError("follow-player distances must be non-negative")
+    if config.memory_loot_pickup_hysteresis_world < 0:
+        raise ValueError(
+            "memory_loot_pickup_hysteresis_world must be non-negative"
+        )
     # Mouse locking is controlled only by the mode configuration. Job-specific
     # behavior must not silently override the user's cursor preference.
     effective_mouse_lock = lock_mouse_to_monster
@@ -3771,6 +3895,7 @@ def run_bot(
     if config.follow_player_enabled:
         menu_items.append("純跟隨")
     menu_items.append("內存拾取")
+    menu_items.append("拾取品質")
     menu_items.append("裝備篩選表")
     if send_input:
         menu_items.append("大量購買 Card")
@@ -4501,6 +4626,7 @@ def run_bot(
                         "follow_mode": follow_mode,
                         "follow_player_name": follow_player_name,
                         "loot_enabled": loot_enabled,
+                        "loot_minimum_rarity": config.memory_loot_min_rarity,
                         "price_window_visible": price_window_visible,
                         "follow_available": config.follow_player_enabled,
                         "card_available": (
@@ -4752,6 +4878,25 @@ def run_bot(
                     f"選單：內存拾取{'開啟' if loot_enabled else '關閉'}。",
                     force=True,
                 )
+            if menu_action == "loot_rarity":
+                selected_rarity = show_loot_rarity_menu(
+                    config.memory_loot_min_rarity
+                )
+                if selected_rarity is not None:
+                    config.memory_loot_min_rarity = selected_rarity
+                    save_config(config_path, config)
+                    memory_loot_active = False
+                    loot_candidate_object_id = None
+                    loot_candidate_frames = 0
+                    loot_clear_frames = 0
+                    loot_skipped_until.clear()
+                    reset_loot_chase(loot_chase, now=now)
+                    request_target(0)
+                    set_keys(())
+                    announce(
+                        f"選單：最低拾取品質已設為 {selected_rarity} 以上。",
+                        force=True,
+                    )
             if menu_action == "navigation":
                 if active:
                     finalize_navigation_statistics(
@@ -4871,7 +5016,7 @@ def run_bot(
                 continue
 
             if (
-                config.job_type == 1
+                config.job_type in NAVIGATION_UPKEEP_JOB_TYPES
                 and send_input
                 and not snapshot.player.summon_mount_action_available
             ):
@@ -5018,9 +5163,10 @@ def run_bot(
                 time.sleep(max(0.05, config.target_lost_wait_ms / 1000))
                 continue
 
-            # Selected job-type-1 summons/buffs gate formal F8 navigation only.
-            # Stop movement before emitting the one-shot skill IPC so the key
-            # cannot race with a stale movement request.
+            # Selected job-type-1 summons/buffs gate every navigation mode,
+            # including pure following. Stop WASD and both Shift keys before
+            # emitting the one-shot skill IPC; navigation resumes only after a
+            # later snapshot confirms that every selected item is present.
             check_enabled = summoner_checks_enabled(
                 config,
                 snapshot.player,
@@ -5531,7 +5677,11 @@ def run_bot(
                 reset_loot_chase(loot_chase, now=now)
 
             if loot_target is not None:
-                loot_rule_label = "Legendary"
+                loot_rule_label = (
+                    "Legendary"
+                    if mode == 3
+                    else config.memory_loot_min_rarity
+                )
                 if loot_chase.target_object_id != loot_target.object_id:
                     reset_loot_chase(
                         loot_chase,
@@ -5573,6 +5723,24 @@ def run_bot(
                     range_padding_world=config.memory_loot_range_padding_world,
                     max_distance_world=config.memory_loot_max_distance_world,
                 ) and player_map_exit is None
+                loot_hold_in_range = (
+                    loot_chase.release_started_at is not None
+                    and distance_to_loot
+                    <= loot_pickup_hold_radius(
+                        snapshot.player,
+                        loot_target,
+                        range_padding_world=(
+                            config.memory_loot_range_padding_world
+                        ),
+                        hysteresis_world=(
+                            config.memory_loot_pickup_hysteresis_world
+                        ),
+                        max_distance_world=(
+                            config.memory_loot_max_distance_world
+                        ),
+                    )
+                    and player_map_exit is None
+                )
                 if loot_candidate_frames < max(1, config.memory_loot_confirm_frames):
                     request_target(0)
                     desired_loot_keys: tuple[str, ...] = ()
@@ -5581,7 +5749,11 @@ def run_bot(
                         f"MEMORY LOOT CANDIDATE {loot_target.object_id} "
                         f"{loot_target.rarity} {loot_label}"
                     )
-                elif not loot_in_range:
+                elif not (loot_in_range or loot_hold_in_range):
+                    # Re-entering pickup range must always start with a fresh
+                    # neutral-input phase, even if this same loot was briefly
+                    # in range on an earlier frame.
+                    loot_chase.release_started_at = None
                     request_target(loot_target.object_id, "loot")
                     safe_loot_path = request_path_matches(
                         snapshot.path,
@@ -5792,35 +5964,45 @@ def run_bot(
                     continue
                 else:
                     request_target(0)
-                    reset_loot_chase(
-                        loot_chase,
-                        now=now,
-                        target_object_id=loot_target.object_id,
-                        player_position=snapshot.player.position,
-                    )
                     desired_loot_keys = ()
                     set_keys(desired_loot_keys)
-                    action = "LOOT PRESS V" if send_input else "WOULD PRESS V"
-                    status = (
-                        f"{loot_ownership_label(loot_target)} {action} "
-                        f"{loot_target.object_id} "
-                        f"{loot_target.rarity} {loot_label}"
-                    )
-                    if (
-                        now - last_loot_interact
-                        >= config.memory_loot_interact_cooldown_ms / 1000
-                    ):
-                        if send_input:
-                            request_loot_pickup(loot_target.object_id)
-                        last_loot_interact = time.monotonic()
+                    if loot_chase.release_started_at is None:
+                        loot_chase.release_started_at = now
                         announce(
-                            f"內存掉落物：{loot_target.object_id} "
-                            f"[{loot_ownership_label(loot_target)}/"
-                            f"{loot_target.rarity}/{loot_target.loot_type}] "
-                            f"{loot_label}；"
-                            f"{'已按 V' if send_input else '預覽，不送 V'}。",
+                            f"拾取 {loot_target.object_id} 前先放開所有移動鍵與 Shift。",
                             force=True,
                         )
+                    release_elapsed = now - loot_chase.release_started_at
+                    release_settle = (
+                        config.memory_loot_release_settle_ms / 1000
+                    )
+                    if release_elapsed < release_settle:
+                        status = (
+                            f"LOOT RELEASE ALL KEYS {loot_target.object_id} "
+                            f"WAIT={max(0.0, release_settle - release_elapsed):.2f}s"
+                        )
+                    else:
+                        action = "LOOT PRESS V" if send_input else "WOULD PRESS V"
+                        status = (
+                            f"{loot_ownership_label(loot_target)} {action} "
+                            f"{loot_target.object_id} "
+                            f"{loot_target.rarity} {loot_label}"
+                        )
+                        if (
+                            now - last_loot_interact
+                            >= config.memory_loot_interact_cooldown_ms / 1000
+                        ):
+                            if send_input:
+                                request_loot_pickup(loot_target.object_id)
+                            last_loot_interact = now
+                            announce(
+                                f"內存掉落物：{loot_target.object_id} "
+                                f"[{loot_ownership_label(loot_target)}/"
+                                f"{loot_target.rarity}/{loot_target.loot_type}] "
+                                f"{loot_label}；"
+                                f"{'已送撿取' if send_input else '預覽，不送撿取'}。",
+                                force=True,
+                            )
                 if config.debug_window:
                     cv2.imshow(
                         RADAR_WINDOW_NAME,

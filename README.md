@@ -45,7 +45,7 @@ C:\Program Files (x86)\Steam\steamapps\common\SpiritVale\BepInEx\ondemand\Spirit
 .\build_release.ps1
 ```
 
-ZIP 會輸出至 `dist\SpiritValeBot-v2.22.0-win64.zip`，包含 Loader、按需探針、可攜式 LocalAppData IPC、一鍵安裝、Python 虛擬環境設定與啟動腳本，不包含測試、原始 C#、執行期 JSON、個人裝備篩選規則或本機報告。
+ZIP 會輸出至 `dist\SpiritValeBot-v2.23.4-win64.zip`，包含 Loader、按需探針、可攜式 LocalAppData IPC、一鍵安裝、Python 虛擬環境設定與啟動腳本，不包含測試、原始 C#、執行期 JSON、個人裝備篩選規則或本機報告。
 
 ## 執行
 
@@ -134,6 +134,7 @@ python spiritvale_red_dot_bot.py --mode-config .\spiritvale_mode_config.json --r
 - **一般導航（開/關）**：切換一般怪物／拾取導航；Mode Config 啟用 `lock_mouse_to_monster` 時也會切換怪物滑鼠鎖定。純跟隨啟用時不受此項影響，且不會鎖定滑鼠。
 - **純跟隨模式（開/關）**：選擇後開啟角色名稱輸入視窗並啟用獨立純跟隨；再次選擇即關閉。
 - **內存拾取（開/關）**：切換內存掉落物拾取。
+- **拾取品質**：選擇 `Common`、`Rare`、`Unique` 或 `Legendary` 以上；選擇後立即套用並保存至設定檔。
 - **裝備詞條篩選表**：顯示或隱藏依裝備名稱區分的詞條篩選表。先選裝備名稱，再替該名稱獨立填寫 232 種附有中文說明的 `StatType` 最低畫面值與「至少符合 N 項」，或按「此名稱一律分解」忽略全部素質；搜尋框同時支援英文代碼與中文名稱。
 - **大量購買 Card**：僅在正式 BOT 模式出現，顯示常駐大量購買視窗；輸入必須保留的金幣餘額與單卡價格上限後，持續購買單價嚴格小於上限的 `Card`。再次選擇只會將同一視窗帶到前景。
 - **價格視窗（顯示/隱藏）**：顯示或隱藏背包價格視窗（需啟用查價）。
@@ -158,7 +159,7 @@ F8／預覽從 `MapInstance.Players` 匯出其他玩家；清單不可用時才�
 
 F2 會顯示隊伍成員所在的「第幾頻道」。目標與本機不在同一伺服器實例時先呼叫遊戲的 `TrySwitchToInstance`，實例相同但頻道不同時呼叫 `RequestChannelSwitch`；切換期間放開所有移動鍵並保留 PlayerId 鎖定。新分流出現同一玩家後，當輪就建立玩家 NavMesh 路徑並接續跟隨，不必再按 F2。
 
-F2 是不依賴 F8 的純跟隨模式：每輪都以 `target_kind: player` 更新 NavMesh 路徑，超過雙方碰撞半徑加 `follow_player_stop_padding_world` 時送出 WASD，進入停靠距離後停止 WASD。路徑有效且玩家可用時會持續按住 Left Shift 與 Right Shift，即使已經停靠也不放開；此模式不選怪、不進入戰鬥流程、不追蹤掉落物，也不按 V。F7 與 F8 的切換狀態會保留，等再次按 F2 關閉後才套用於一般導航。
+F2 是不依賴 F8 的純跟隨模式：每輪都以 `target_kind: player` 更新 NavMesh 路徑，超過雙方碰撞半徑加 `follow_player_stop_padding_world` 時送出 WASD，進入停靠距離後停止 WASD。`job_type = 1` 會先確認所有已啟用的召喚物／Buff；若有缺漏會放開 WASD 與左右 Shift、逐項補放，全部確認存在後才開始跟隨。路徑有效且玩家可用時會持續按住 Left Shift 與 Right Shift，即使已經停靠也不放開；此模式不選怪、不進入戰鬥流程、不追蹤掉落物，也不按 V。F7 與 F8 的切換狀態會保留，等再次按 F2 關閉後才套用於一般導航。
 
 玩家消失、死亡、隱藏、切圖、快照失效或路徑未就緒時會顯示 `FOLLOW LOST`／`FOLLOW WAIT PATH` 並立即放開 WASD 與左右 Shift；同一 PlayerId 重現且路徑恢復後才繼續。召喚坐騎維護仍優先執行，等待 9、0 與坐騎確認期間也會安全放開移動鍵。
 
@@ -187,12 +188,14 @@ NavMesh 只處理靜態可行走區域。舊版透過小地圖顏色偵測的藍
 2. 探針在建立掉落物快照前排除 `Equip`／`Equipment`；不再讀取地面 `LootDrop.ItemData`、轉換詞條、查拍賣或嘗試拾取裝備。
 3. 對保留的非裝備掉落物，探針將 `LockDto.PlayerId` 與本機 `PlayerController.PlayerId` 比對，輸出本人、外人與公開物品的所有權，並以遊戲的 `IsLocked(player)` 標示本機目前是否可互動。
 4. F7 開啟時，非裝備掉落物維持稀有度規則；外人或公開的 Legendary 只有自然進入 `InteractionRange + padding`（不再加玩家碰撞半徑）且不超過硬上限後才會互動。伺服器判定拾取只看玩家「中心點」是否在 `InteractionRange` 內、不採計碰撞半徑，因此 `memory_loot_range_padding_world` 可為負值把按鍵點內縮到範圍內（預設 -0.2，讓角色貼近才按）。
-5. 合格的遠距自有非裝備掉落物會優先於怪物導航；Python 以 `target_kind: loot` 要求探針計算 NavMesh 路徑。同一 ObjectId 連續出現兩個 snapshot 後才開始追蹤或拾取。進入有效範圍後會先放開 WASD 與 Shift，再以 `loot_interact` IPC 意圖要求探針按下拾取鍵；物品仍存在時每 500 ms 重試。
-6. 預覽模式顯示 `WOULD PRESS V`，不送任何輸入或拾取意圖。
+5. 合格的遠距自有非裝備掉落物會優先於怪物導航；Python 以 `target_kind: loot` 要求探針計算 NavMesh 路徑。同一 ObjectId 連續出現兩個 snapshot 後才開始追蹤或拾取。進入有效範圍後會先放開 WASD 與 Shift，再以 `loot_interact` 序號與 `loot_interact_object_id` 要求探針點選指定掉落物；物品仍存在時每 500 ms 重試。
+6. 預覽模式顯示 `WOULD PICK UP TARGET`，不送任何輸入或拾取意圖。
 
-拾取以探針意圖驅動而非背景按鍵：Unity 對未聚焦視窗會忽略 `PostMessage`，所以 Python 送出遞增的 `loot_interact` 序號與獨立的 `loot_interact_object_id`（因為拾取前移動與導航目標會先歸零讓角色停下）。**遊戲的拾取是一個動作熱鍵 `Hotkey.Pickup`（等同按 V），並非某個可直接呼叫的方法**——實測 `LootDrop.Interact`、`PlayerController.PickupSingle/DoPickup/ProcessClickedInteractable` 以及模擬點擊都無效（同幀的輸入處理會清掉它們設定的互動狀態）。因此探針改為在建構輸入 DTO 時，把 `Pickup` 熱鍵位元 OR 進 `inputs.Hotkeys/HotkeysHeld`（`1UL << Pickup`，hold 約 200 ms），並在 `ProcessMovement` 後呼叫 `ProcessSkills` 派發——與坐騎注入熱鍵完全同一套機制。啟動時會記錄 `Background pickup hotkeys: Pickup=NN; Interact=MM`（`-1` 代表沒解析到該熱鍵）。
+拾取透過遊戲原本的指定互動流程：探針把掉落物的 ObjectId 寫入 `PlayerInputDto.InteractableId`，同一份 DTO 設定 `Click=true`、`UnitId=0`，清除移動與技能熱鍵，先執行本機 `ApplyInputs → ProcessTargeting`，再經 `SendInputsToServer` 傳送。伺服器解析指定 ID，依正常距離、鎖定、背包與分配規則執行 `LootDrop.Interact → PickupSingle`。探針會重新檢查快取物件的 ID、存活顯示狀態、地圖、類型與鎖定；技能施放中或等待技能選取目標時，留待下次請求重試。
 
-拾取策略可即時調整而不需重編／重啟遊戲：探針每 300 ms 重讀 `%LOCALAPPDATA%\SpiritValeBot\loot_pickup_strategy.txt`，內容為以 `+` 組合的 token——`pickup`、`interact`（要注入哪個熱鍵）、`processskills`、`clickskill`、`target`（用哪種方式派發）。檔案不存在時採用預設 `pickup+processskills`。
+`UnitId` 用於技能／戰鬥單位；`InteractableId` 才是此處的網路互動目標。舊實作雖收到掉落物 ID，實際只注入 `Hotkey.Pickup`（V），由伺服器 `ApplyInputs` 執行範圍拾取。直接在客戶端呼叫 `LootDrop.Interact` 則被遊戲的 `App.IsServer` 檢查擋下。新版不再使用 V、200 ms 按住或 `loot_pickup_strategy.txt`；每個序號只送一次指定點擊，物品仍存在時由 Python 的 500 ms 冷卻重試。
+
+紀錄 `Targeted loot input sent` 會列出請求序號、目標 `interactable_id`、`unit_id`、`click` 與熱鍵值。這只表示輸入已送出，並非拾取成功；消失判定仍沿用掉落物快照。實際遊戲可能因背包滿、鎖定或掉落物已被其他玩家取走而拒絕。調查與測試位於 `diagnostics/loot_pickup/`。
 
 地面裝備拾取前估價功能已廢棄並移除；原因是伺服器不會在拾取前同步可供完全一致比價的完整 `EquipData`。背包 F6 查價不受影響。
 
@@ -286,9 +289,11 @@ python spiritvale_inventory_pricer.py
 - `stuck_position_epsilon_world` / `stuck_timeout_sec`：以真實世界座標判斷卡住。
 - `memory_loot_min_rarity`：最低拾取稀有度，可設為 `Common`、`Rare`、`Unique` 或 `Legendary`。
 - `memory_loot_range_padding_world`：在掉落物 `InteractionRange` 之上的拾取容差（不再加玩家碰撞半徑），預設 **-0.2** 世界單位；伺服器只看玩家中心點是否在 `InteractionRange` 內，故用負值把按鍵點內縮到範圍內、確保生效。
+- `memory_loot_pickup_hysteresis_world`：開始放開按鍵後的退出遲滯，預設 0.25 世界單位；只會擴到物品真正的 `InteractionRange`，避免邊界抖動反覆重算放鍵等待，又不會站在伺服器範圍外送撿取。
 - `memory_loot_max_distance_world`：允許按拾取鍵互動的絕對距離上限，預設 3.0；更遠的合格自有物品會透過 NavMesh 接近，外人與公開物品只在自然進入範圍後處理。
 - `memory_loot_confirm_frames` / `memory_loot_clear_confirm_frames`：掉落物出現與消失的穩定確認幀數。
 - `memory_loot_interact_cooldown_ms`：物品仍存在時重試拾取鍵的間隔，預設 500 ms。
+- `memory_loot_release_settle_ms`：進入拾取距離後先放開 WASD、Left Shift、Right Shift，至少經過一個完全無按鍵迴圈才送撿取；預設 50 ms。指定拾取封包本身也會清空移動與技能鍵。
 - `memory_loot_chase_timeout_sec`：單次主動追蹤 Legendary 的時間上限，預設 20 秒。
 - `memory_loot_retry_cooldown_sec`：Legendary 路徑無效、逾時或脫困失敗後的重試冷卻，預設 15 秒。
 - `auto_relogin_enabled`：是否允許執行模式在 F8 一般導航或 F2 純跟隨啟用時自動重登，預設開啟。
@@ -304,7 +309,7 @@ python spiritvale_inventory_pricer.py
 - `follow_player_enabled`：是否提供 F2 跟隨玩家模式，預設開啟。
 - `follow_monster_radius_world`：舊版跟隨打怪半徑，為相容既有設定檔而保留；F2 純跟隨不使用此值。
 - `job_type`：`0` 為未滿 64 等、F8 持續按住 Left Shift；`1` 為召喚、F8 持續按住 Left Shift 與 Right Shift；`2` 為牧師，滑鼠成功鎖定怪物後會立即短按 Left Shift，之後依 `priest_left_shift_tap_min_interval_ms` 與 `priest_left_shift_tap_max_interval_ms`（預設 300–1300 ms）的隨機間隔重複，每次按住時間由 `priest_left_shift_tap_hold_ms`（預設 50 ms）決定。牧師短按只在 F8 正式追蹤且滑鼠成功鎖怪時發生，不用於掉落物。滑鼠鎖定與點擊仍完全依 mode config。只有 `1` 會在 F8 一般導航或 F2 純跟隨啟用時持續確認 `MountController_C`；若尚未騎乘，Python 固定短按 `summon_reanimation_key`（預設 `9`），等待 `summon_reanimation_delay_ms`（預設 750 ms）後短按 `summon_mount_key`（預設 `0`）。若尚未確認騎乘，會依 `summon_mount_key_retry_delay_ms`（預設 400 ms）只重試 `0`，4 秒總確認期限不會因重試而延長；逾時後才等待 2.5 秒重新從 `9` 開始。確認坐騎控制器出現前會放開移動鍵並暫停所有導航。F2 的 Shift 規則完全獨立，三種職業都固定同時按住左右 Shift。舊設定中的 `always_hold_lshift` 會被忽略。預設為 `1`。
-- `summoner_checks`：只套用於 `job_type = 1` 的正式 F8 導航。F8 選單可個別啟用召喚物與 Buff，並指定右側 NumPad 0–9。召喚物依目前 `SummonDisplays_C` 判斷，一般 Buff 依目前 `StatusDisplays_C` 判斷；`GuardianBond` 需要探針 v2.22.1，會驗證召喚物擁有者、在同一處理階段指定目標並施放，再以同步的對外連結確認成功。自身有別人提供的 GuardianBond 不算完成。沒有自己的存活召喚物時等待；GuardianBond 每次至少等待 2500 ms 再重試，其餘技能依 `summoner_check_settle_ms` 與 `summoner_check_retry_delay_ms` 設定。缺少項目時暫停導航，每次只觸發一項，全部存在後接續坐騎確認與導航。預設各項關閉，F2 不執行檢查。
+- `summoner_checks`：套用於 `job_type = 1` 的正式 F8 導航與 F2 純跟隨。F8 選單可個別啟用召喚物與 Buff，並指定右側 NumPad 0–9。召喚物依目前 `SummonDisplays_C` 判斷，一般 Buff 依目前 `StatusDisplays_C` 判斷；`GuardianBond` 需要探針 v2.22.1，會驗證召喚物擁有者、在同一處理階段指定目標並施放，再以同步的對外連結確認成功。自身有別人提供的 GuardianBond 不算完成。沒有自己的存活召喚物時等待；GuardianBond 每次至少等待 2500 ms 再重試，其餘技能依 `summoner_check_settle_ms` 與 `summoner_check_retry_delay_ms` 設定。缺少項目時會先放開 WASD 與左右 Shift，每次只觸發一項；全部確認存在後才接續坐騎確認與導航。預設各項關閉。
 - 正式執行時，每次開啟一般導航都會開始一筆運行時間與金幣總收入統計。金幣由 `PlayerSave.PlayerData.Coins` 讀取，只累加餘額上升的差額，支出不扣除；純跟隨期間完全排除。手動關閉導航、Mode 3 安全暫停或安全結束時，主控台會顯示運行時間、總收入與目前餘額。金幣資料中斷時會採最後有效值並警告收入可能低估，不顯示彈窗或保存歷史。
 - `follow_player_stop_padding_world`：跟隨停靠距離在雙方碰撞半徑外增加的 padding，預設 2.0。
 - `follow_player_rejoin_distance_world`：舊版回跟門檻，為相容既有設定檔而保留；F2 現在會持續追蹤玩家，不使用此值。

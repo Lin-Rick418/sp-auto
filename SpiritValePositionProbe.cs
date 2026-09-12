@@ -15,7 +15,7 @@ using HarmonyLib;
 
 namespace SpiritValePositionProbe
 {
-    [BepInPlugin("local.spiritvale.positionprobe", "SpiritVale Position Probe", "2.22.1")]
+    [BepInPlugin("local.spiritvale.positionprobe", "SpiritVale Position Probe", "2.23.4")]
     public sealed class Plugin : BasePlugin
     {
         internal const int SchemaVersion = 1;
@@ -240,7 +240,7 @@ namespace SpiritValePositionProbe
             }
 
             Log.LogInfo(
-                "Memory navigation probe v2.22.1 loaded on demand; auto_relogin="
+                "Memory navigation probe v2.23.4 loaded on demand; auto_relogin="
                 + (autoReloginEnabled ? "enabled" : "disabled")
                 + "; run_in_background="
                 + (runInBackgroundEnabled ? "enabled" : "unavailable")
@@ -780,14 +780,9 @@ namespace SpiritValePositionProbe
         private static string _lastSummonAction = string.Empty;
         private static long _lastSkillKeyRequestId;
         private static int _lastLootClickSeq;
-        private static int _lootClickObjectId;
-        private static long _lootClickHoldUntilMs;
-        private static readonly Stopwatch LootClickTimer = Stopwatch.StartNew();
-        private static int _pickupHotkeyValue = -1;
-        private static int _interactHotkeyValue = -1;
-        private static string _pickupStrategy = "pickup+processskills";
-        private static long _pickupStrategyReadMs = long.MinValue;
-        private static string _pickupStrategyPath;
+        private static PropertyInfo _interactableId;
+        private static PropertyInfo _lootId;
+        private static PropertyInfo _skillReady;
 
         internal static void Initialize(ManualLogSource log)
         {
@@ -803,6 +798,9 @@ namespace SpiritValePositionProbe
             _hotkeys = FindProperty(_inputDtoType, "Hotkeys");
             _hotkeysHeld = FindProperty(_inputDtoType, "HotkeysHeld");
             _unitId = FindProperty(_inputDtoType, "UnitId");
+            _interactableId = FindProperty(_inputDtoType, "InteractableId");
+            _lootId = FindProperty(_inputDtoType, "LootId");
+            _skillReady = FindProperty(playerType, "SkillReady");
             _clickPosition = FindProperty(_inputDtoType, "ClickPosition");
             _fastCastPosition = FindProperty(
                 _inputDtoType, "FastCastPosition"
@@ -1030,9 +1028,11 @@ namespace SpiritValePositionProbe
                 bool authorized = _request != null
                     && _request.BotActive
                     && IsSendMode(mode);
-                if (!authorized && !_wasSending)
-                    return;
                 if (!IsLocalPlayer(__instance))
+                    return;
+                if (_request != null && (!authorized || !_request.LootScanActive))
+                    _lastLootClickSeq = _request.LootInteract;
+                if (!authorized && !_wasSending)
                     return;
 
                 float x = authorized ? _request.MovementWorldX : 0f;
@@ -1064,13 +1064,27 @@ namespace SpiritValePositionProbe
                     _fastCastPosition.SetValue(inputs, focusPosition, null);
                 }
                 bool lootPickupActive = authorized
-                    && ApplyPendingLootPickup(inputs);
+                    && ApplyPendingLootPickup(__instance, inputs);
+                if (lootPickupActive)
+                {
+                    focusTargetObjectId = 0;
+                    focusResolved = false;
+                    injectedShiftKeys = string.Empty;
+                }
                 _inputs.SetValue(__instance, inputs, null);
                 _currentInputs.SetValue(__instance, inputs, null);
                 if (focusResolved)
                     ApplyResolvedFocus(__instance);
 
-                if (authorized && mode == "send_apply")
+                if (lootPickupActive)
+                {
+                    // Use the same local targeting path as a normal click and
+                    // send this exact DTO to the server below. LootDrop.Interact
+                    // itself is server-only; ProcessSkills does not consume V.
+                    _applyInputs.Invoke(__instance, new object[] { inputs });
+                    _processTargeting.Invoke(__instance, null);
+                }
+                else if (authorized && mode == "send_apply")
                     _applyInputs.Invoke(__instance, new object[] { inputs });
                 else if (authorized && mode == "send_process")
                 {
@@ -1080,23 +1094,6 @@ namespace SpiritValePositionProbe
                         _processTargeting.Invoke(__instance, null);
                         if (focusResolved)
                             ApplyResolvedFocus(__instance);
-                    }
-                    // Dispatch the injected Pickup/Interact hotkey. The bitmask
-                    // is consumed by ProcessSkills (like shift skills); strategy
-                    // tokens allow live-tuning without a rebuild.
-                    if (lootPickupActive)
-                    {
-                        string pickupStrategy = GetPickupStrategy();
-                        if (pickupStrategy.Contains("processskills"))
-                            _processSkills.Invoke(__instance, null);
-                        if (pickupStrategy.Contains("clickskill")
-                            && _pickupHotkeyValue >= 0)
-                            _clickSkill.Invoke(
-                                __instance,
-                                new object[] { _pickupHotkeyValue }
-                            );
-                        if (pickupStrategy.Contains("target"))
-                            _processTargeting.Invoke(__instance, null);
                     }
                     if (!captureHandlesSkills
                         && (injectedShiftKeys.Length > 0
@@ -1116,7 +1113,7 @@ namespace SpiritValePositionProbe
                     }
                 }
 
-                if (authorized)
+                if (authorized && !lootPickupActive)
                 {
                     FireSummonActionHotkeys(__instance, _request.SummonAction);
                     FireSkillKeyHotkeys(
@@ -1127,16 +1124,23 @@ namespace SpiritValePositionProbe
                         _request.SkillKeyTargetSummon
                     );
                 }
-                else
+                else if (!authorized)
                 {
                     _lastSummonAction = string.Empty;
                     _lastSkillKeyRequestId = _request.SkillKeyRequestId;
                     // Absorb any pending loot pulse while unauthorized so a stale
-                    // pickup hotkey does not fire the moment control resumes.
+                    // pickup click does not fire the moment control resumes.
                     _lastLootClickSeq = _request.LootInteract;
                 }
 
                 _sendInputsToServer.Invoke(__instance, new object[] { inputs });
+                if (lootPickupActive)
+                    _log.LogInfo("Targeted loot input sent: seq=" + _lastLootClickSeq
+                        + " requested=" + _request.LootInteractObjectId
+                        + " interactable_id=" + _interactableId.GetValue(inputs, null)
+                        + " unit_id=" + _unitId.GetValue(inputs, null)
+                        + " click=" + _click.GetValue(inputs, null)
+                        + " hotkeys=" + _hotkeys.GetValue(inputs, null));
                 _wasSending = authorized;
                 _lastShiftKeys = injectedShiftKeys;
 
@@ -1489,81 +1493,46 @@ namespace SpiritValePositionProbe
             ClickHotkeys(playerController, hotkeys);
         }
 
-        private static string GetPickupStrategy()
+        // One click per IPC sequence, with its network target in the same DTO.
+        // The server resolves InteractableId and runs the normal locked/range/
+        // inventory checks. UnitId addresses combat units, not ground loot.
+        private static bool ApplyPendingLootPickup(object player, object inputs)
         {
-            long nowMs = LootClickTimer.ElapsedMilliseconds;
-            if (nowMs - _pickupStrategyReadMs > 300L)
-            {
-                _pickupStrategyReadMs = nowMs;
-                try
-                {
-                    if (_pickupStrategyPath == null)
-                        _pickupStrategyPath = System.IO.Path.Combine(
-                            Environment.GetFolderPath(
-                                Environment.SpecialFolder.LocalApplicationData
-                            ),
-                            "SpiritValeBot",
-                            "loot_pickup_strategy.txt"
-                        );
-                    if (System.IO.File.Exists(_pickupStrategyPath))
-                    {
-                        string text = System.IO.File
-                            .ReadAllText(_pickupStrategyPath)
-                            .Trim()
-                            .ToLowerInvariant();
-                        if (text.Length > 0)
-                            _pickupStrategy = text;
-                    }
-                }
-                catch
-                {
-                    // Missing/locked knob file: keep the last strategy.
-                }
-            }
-            return _pickupStrategy;
-        }
-
-        // Pickup is the game's "Pickup" action hotkey (default V), so drive it
-        // through the input hotkey bitmask exactly like mount drives its hotkey,
-        // rather than a click or a direct method call. Returns whether a pickup
-        // hotkey is being pressed this frame (so the caller dispatches it).
-        private static bool ApplyPendingLootPickup(object inputs)
-        {
-            if (_request == null)
+            if (_request == null || !_request.BotActive || !_request.LootScanActive)
                 return false;
             int seq = _request.LootInteract;
             int objectId = _request.LootInteractObjectId;
-            long nowMs = LootClickTimer.ElapsedMilliseconds;
-            if (seq > 0 && seq != _lastLootClickSeq && objectId > 0)
-            {
-                _lastLootClickSeq = seq;
-                _lootClickObjectId = objectId;
-                _lootClickHoldUntilMs = nowMs + 200L;
-            }
-            if (_lootClickObjectId <= 0 || nowMs > _lootClickHoldUntilMs)
+            if (seq <= 0 || seq == _lastLootClickSeq)
                 return false;
-            string strategy = GetPickupStrategy();
-            ulong pressed = ToUInt64(_hotkeys.GetValue(inputs, null));
-            ulong held = ToUInt64(_hotkeysHeld.GetValue(inputs, null));
-            bool any = false;
-            if (strategy.Contains("pickup") && _pickupHotkeyValue >= 0)
-            {
-                ulong bit = 1UL << _pickupHotkeyValue;
-                pressed |= bit;
-                held |= bit;
-                any = true;
-            }
-            if (strategy.Contains("interact") && _interactHotkeyValue >= 0)
-            {
-                ulong bit = 1UL << _interactHotkeyValue;
-                pressed |= bit;
-                held |= bit;
-                any = true;
-            }
-            if (!any)
+            _lastLootClickSeq = seq;
+            if (objectId <= 0)
                 return false;
-            _hotkeys.SetValue(inputs, pressed, null);
-            _hotkeysHeld.SetValue(inputs, held, null);
+            string rejection;
+            if (!PlayerUpdatePatch.CanInteractWithCachedLoot(player, objectId, out rejection))
+            {
+                _log.LogInfo("Targeted loot input skipped: id=" + objectId + " reason=" + rejection);
+                return false;
+            }
+            object skills = FindProperty(player.GetType(), "Skills").GetValue(player, null);
+            if (skills == null || Convert.ToBoolean(FindProperty(skills.GetType(), "IsCasting")
+                .GetValue(skills, null)) || _skillReady.GetValue(player, null) != null)
+            {
+                _log.LogInfo("Targeted loot input skipped: id=" + objectId + " reason=skill busy");
+                return false;
+            }
+            _move.SetValue(inputs, CreateMoveVector(0f, 0f, 0f), null);
+            _hotkeys.SetValue(inputs, 0UL, null);
+            _hotkeysHeld.SetValue(inputs, 0UL, null);
+            _unitId.SetValue(inputs, 0, null);
+            _lootId.SetValue(inputs, 0, null);
+            _interactableId.SetValue(inputs, objectId, null);
+            _click.SetValue(inputs, true, null);
+            _altClick.SetValue(inputs, false, null);
+            _fastCast.SetValue(inputs, false, null);
+            _skillHold.SetValue(inputs, false, null);
+            _clickSkillIndex.SetValue(inputs, -1, null);
+            _clickPosition.SetValue(inputs, CreateMoveVector(0f, 0f, 0f), null);
+            _fastCastPosition.SetValue(inputs, CreateMoveVector(0f, 0f, 0f), null);
             return true;
         }
 
@@ -1681,12 +1650,7 @@ namespace SpiritValePositionProbe
                     )
                 );
             }
-            _pickupHotkeyValue = TryGetHotkeyValue(hotkeyType, "Pickup");
-            _interactHotkeyValue = TryGetHotkeyValue(hotkeyType, "Interact");
-            log.LogInfo(
-                "Background pickup hotkeys: Pickup=" + _pickupHotkeyValue
-                + "; Interact=" + _interactHotkeyValue
-            );
+
         }
 
         private static int TryGetHotkeyValue(Type hotkeyType, string name)
@@ -7356,7 +7320,7 @@ namespace SpiritValePositionProbe
                     _objectId.GetValue(loot, null), CultureInfo.InvariantCulture
                 );
                 if (objectId > 0)
-                    _lootCache.Remove(objectId);
+                    RemoveLootFromCaches(objectId);
             }
             catch
             {
@@ -9347,6 +9311,100 @@ namespace SpiritValePositionProbe
             }
         }
 
+        internal static bool CanInteractWithCachedLoot(object player, int objectId, out string reason)
+        {
+            reason = "missing cached loot";
+            CachedLootEntry entry;
+            if (player == null || objectId <= 0)
+                return false;
+            if (!_lootCache.TryGetValue(objectId, out entry))
+            {
+                // The incremental exported snapshot can outlive the live
+                // interaction cache. Purge that ghost immediately so Python
+                // does not circle and retry it until the next full scan pass.
+                RemovePublishedLoot(objectId);
+                return false;
+            }
+            try
+            {
+                object loot = entry.SourceValue;
+                if (loot == null || !_lootType.IsInstanceOfType(loot)
+                    || GetUnitObjectId(loot) != objectId)
+                {
+                    RemoveLootFromCaches(objectId);
+                    return false;
+                }
+                object gameObject = _componentGameObject.GetValue(loot, null);
+                reason = "inactive loot";
+                if (gameObject == null || !Convert.ToBoolean(
+                    _gameObjectActiveInHierarchy.GetValue(gameObject, null)))
+                {
+                    RemoveLootFromCaches(objectId);
+                    return false;
+                }
+                object transform = _componentTransform.GetValue(loot, null);
+                object position = transform == null ? null : _transformPosition.GetValue(transform, null);
+                reason = "wrong map or missing position";
+                if (position == null || !SceneLootMatchesMap(loot, CurrentMapInstance(player),
+                    GetUnitPositionValue(player), position))
+                {
+                    RemoveLootFromCaches(objectId);
+                    return false;
+                }
+                object dtoSync = _lootDto.GetValue(loot, null);
+                object dto = dtoSync == null ? null : _lootDtoValue.GetValue(dtoSync, null);
+                reason = "missing data or excluded equipment";
+                if (dto == null)
+                {
+                    RemoveLootFromCaches(objectId);
+                    return false;
+                }
+                string kind = Convert.ToString(_lootDtoType.GetValue(dto, null));
+                if (string.Equals(kind, "Equip", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(kind, "Equipment", StringComparison.OrdinalIgnoreCase))
+                {
+                    RemoveLootFromCaches(objectId);
+                    return false;
+                }
+                object lockSync = _lootLock.GetValue(loot, null);
+                object lockValue = lockSync == null ? null : _lootLockValue.GetValue(lockSync, null);
+                reason = "locked loot";
+                if (lockValue == null || Convert.ToBoolean(
+                    _lootIsLocked.Invoke(lockValue, new object[] { player })))
+                    return false;
+                reason = string.Empty;
+                return true;
+            }
+            catch (Exception error)
+            {
+                reason = Unwrap(error).GetType().Name + ": " + Unwrap(error).Message;
+                RemoveLootFromCaches(objectId);
+                return false;
+            }
+        }
+
+        private static void RemovePublishedLoot(int objectId)
+        {
+            if (objectId <= 0)
+                return;
+            for (int index = _cachedLoots.Count - 1; index >= 0; index--)
+            {
+                LootSnapshot snapshot = _cachedLoots[index];
+                if (snapshot != null && snapshot.ObjectId == objectId)
+                    _cachedLoots.RemoveAt(index);
+            }
+            _cachedLootScan.Cached = _lootCache.Count;
+            _cachedLootScan.Exported = _cachedLoots.Count;
+        }
+
+        private static void RemoveLootFromCaches(int objectId)
+        {
+            if (objectId <= 0)
+                return;
+            _lootCache.Remove(objectId);
+            RemovePublishedLoot(objectId);
+        }
+
         private static void ProcessLootForCache(
             object loot,
             object mapInstance,
@@ -9376,7 +9434,7 @@ namespace SpiritValePositionProbe
                 ))
                 {
                     diagnostics.RejectedInactive++;
-                    _lootCache.Remove(objectId);
+                    RemoveLootFromCaches(objectId);
                     return;
                 }
 
@@ -9388,7 +9446,7 @@ namespace SpiritValePositionProbe
                 ))
                 {
                     diagnostics.RejectedOtherMap++;
-                    _lootCache.Remove(objectId);
+                    RemoveLootFromCaches(objectId);
                     return;
                 }
 
@@ -9409,7 +9467,7 @@ namespace SpiritValePositionProbe
                         lootType, "Equipment", StringComparison.OrdinalIgnoreCase
                     ))
                 {
-                    _lootCache.Remove(objectId);
+                    RemoveLootFromCaches(objectId);
                     return;
                 }
 

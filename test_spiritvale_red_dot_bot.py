@@ -43,6 +43,7 @@ from spiritvale_red_dot_bot import (
     key_transitions,
     loot_is_within_pickup_range,
     loot_chase_failure_reason,
+    loot_pickup_hold_radius,
     loot_pickup_radius,
     load_mode_config,
     missing_summoner_checks,
@@ -1442,7 +1443,7 @@ class MemoryProtocolTests(unittest.TestCase):
         )
         self.assertEqual(state.phase, "ready")
 
-    def test_summoner_checks_only_enable_for_live_job_one_f8(self) -> None:
+    def test_summoner_checks_enable_for_live_job_one_navigation(self) -> None:
         config = BotConfig()
         config.summoner_checks["Invoker"] = {"enabled": True, "key": "numpad2"}
         player = MemoryPlayer((0, 0, 0), (0, 1), (1, 0), 0.4)
@@ -1455,11 +1456,19 @@ class MemoryProtocolTests(unittest.TestCase):
                 follow_mode=False,
             )
         )
+        self.assertTrue(
+            summoner_checks_enabled(
+                config,
+                player,
+                send_input=True,
+                active=False,
+                follow_mode=True,
+            )
+        )
         for job_type, send_input, active, follow_mode in (
             (2, True, True, False),
             (1, False, True, False),
             (1, True, False, False),
-            (1, True, True, True),
         ):
             config.job_type = job_type
             self.assertFalse(
@@ -1730,7 +1739,7 @@ class MemoryProtocolTests(unittest.TestCase):
             "# Summoner mount maintenance gates either general F8 navigation or"
         )
         check_marker = source.index(
-            "# Selected job-type-1 summons/buffs gate formal F8 navigation only."
+            "# Selected job-type-1 summons/buffs gate every navigation mode,"
         )
         self.assertLess(check_marker, marker)
         self.assertLess(marker, source.index("if follow_mode:", marker))
@@ -1954,6 +1963,53 @@ class MemoryProtocolTests(unittest.TestCase):
             )
         # With start_paused the very first heartbeat is already inactive.
         self.assertFalse(write_request.call_args_list[0].kwargs["bot_active"])
+
+    def test_f8_loot_rarity_menu_saves_and_applies_selection(self) -> None:
+        config = BotConfig(
+            debug_window=False,
+            pricing_enabled=False,
+            start_paused=True,
+            memory_loot_min_rarity="Legendary",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            with patch.object(
+                bot.win32gui, "IsWindow", return_value=True
+            ), patch.object(
+                bot.win32api, "GetAsyncKeyState", return_value=0
+            ), patch.object(
+                bot,
+                "control_menu_hotkey_down",
+                side_effect=[False, True, False, True],
+            ), patch.object(
+                bot,
+                "show_control_menu",
+                side_effect=["loot_rarity", "exit"],
+            ) as control_menu, patch.object(
+                bot, "show_loot_rarity_menu", return_value="Rare"
+            ) as rarity_menu, patch.object(
+                bot, "write_navigation_request"
+            ), patch.object(
+                bot,
+                "update_held_keys",
+                side_effect=lambda hwnd, held, desired: set(desired),
+            ), patch.object(bot, "post_key"), patch.object(bot.time, "sleep"):
+                bot.run_bot(
+                    123,
+                    config,
+                    True,
+                    config_path=config_path,
+                )
+
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(config.memory_loot_min_rarity, "Rare")
+        self.assertEqual(saved["memory_loot_min_rarity"], "Rare")
+        rarity_menu.assert_called_once_with("Legendary")
+        self.assertEqual(
+            control_menu.call_args_list[0].args[0]["loot_minimum_rarity"],
+            "Legendary",
+        )
 
     def test_f8_pause_publishes_inactive_relogin_heartbeat(self) -> None:
         with patch.object(
@@ -2379,6 +2435,101 @@ class FollowPlayerTests(unittest.TestCase):
                 call.args[2] == 70 and call.kwargs["target_kind"] == "player"
                 for call in write_request.call_args_list
             )
+        )
+
+    def test_f2_waits_for_missing_buff_before_wasd_or_shift(self) -> None:
+        followed = observed_player(70, "follow-id", 12, 0, selected=True)
+
+        def snapshot_with_statuses(statuses: tuple[str, ...]) -> MemorySnapshot:
+            local = MemoryPlayer(
+                (0, 0, 0),
+                (0, 1),
+                (1, 0),
+                0.4,
+                active_statuses_available=True,
+                active_status_ids=statuses,
+                is_mounted_summon=True,
+                mounted_summon_state_available=True,
+                summon_mount_action_available=True,
+            )
+            return MemorySnapshot(
+                timestamp_ms=NOW_MS,
+                map_id=1,
+                instance_id=1,
+                player=local,
+                players=(followed,),
+                party_members=same_channel_party_members(),
+                party_state_available=True,
+                monsters=(),
+                path=MemoryPath(
+                    2,
+                    70,
+                    "complete",
+                    ((0, 0, 0), (12, 0, 0)),
+                    target_kind="player",
+                ),
+                player_scan={"source": "map", "accepted": 1},
+            )
+
+        missing = snapshot_with_statuses(())
+        ready = snapshot_with_statuses(("Invoker",))
+        config = BotConfig(
+            debug_window=False,
+            pricing_enabled=False,
+            job_type=1,
+            start_paused=True,
+        )
+        config.summoner_checks["Invoker"] = {
+            "enabled": True,
+            "key": "numpad2",
+        }
+
+        with patch.object(
+            bot.win32gui, "IsWindow", side_effect=[True, True, False]
+        ), patch.object(
+            bot.win32api, "GetAsyncKeyState", return_value=0
+        ), patch.object(
+            bot, "control_menu_hotkey_down", side_effect=[False, True, False]
+        ), patch.object(
+            bot, "show_control_menu", return_value="follow"
+        ), patch.object(
+            bot, "wait_for_party_snapshot", return_value=missing
+        ), patch.object(
+            bot, "prompt_follow_player_name", return_value="Player follow-id"
+        ), patch.object(
+            bot, "load_memory_snapshot", side_effect=[missing, ready]
+        ), patch.object(
+            bot, "request_path_matches", return_value=True
+        ), patch.object(
+            bot, "write_navigation_request"
+        ) as write_request, patch.object(bot, "post_key"), patch.object(
+            bot.time, "sleep"
+        ):
+            bot.run_bot(123, config, True, disable_loot=True)
+
+        requests = write_request.call_args_list
+        skill_index = next(
+            index
+            for index, call in enumerate(requests)
+            if call.kwargs.get("skill_key") == "numpad2"
+        )
+        motion_index = next(
+            index
+            for index, call in enumerate(requests)
+            if call.kwargs.get("movement_keys")
+            or call.kwargs.get("shift_keys")
+        )
+        self.assertLess(skill_index, motion_index)
+        self.assertTrue(
+            all(
+                not call.kwargs.get("movement_keys")
+                and not call.kwargs.get("shift_keys")
+                for call in requests[: motion_index]
+            )
+        )
+        self.assertEqual(
+            set(requests[motion_index].kwargs["shift_keys"]),
+            {"lshift", "rshift"},
         )
 
     def test_f2_is_pure_player_navigation_until_toggled_off(self) -> None:
@@ -3079,6 +3230,7 @@ class LootTests(unittest.TestCase):
             loop_delay_ms=0,
             memory_loot_min_rarity="Legendary",
             memory_loot_confirm_frames=2,
+            memory_loot_release_settle_ms=0,
         )
         player_far = MemoryPlayer((0, 0, 0), (0, 1), (1, 0), 0.45)
         # Distance 1.5 to the loot at x=10: inside the collider-independent
@@ -3266,6 +3418,7 @@ class LootTests(unittest.TestCase):
             pricing_enabled=False,
             loop_delay_ms=0,
             memory_loot_confirm_frames=1,
+            memory_loot_release_settle_ms=0,
             memory_loot_interact_cooldown_ms=0,
         )
         with tempfile.TemporaryDirectory() as directory, patch.object(
@@ -3318,6 +3471,201 @@ class LootTests(unittest.TestCase):
             )
         )
         self.assertEqual(BotConfig().memory_loot_interact_cooldown_ms, 500)
+        self.assertEqual(BotConfig().memory_loot_release_settle_ms, 50)
+
+    def test_pickup_releases_shift_and_movement_before_interact(self) -> None:
+        player_far = MemoryPlayer((0, 0, 0), (0, 1), (1, 0), 0.45)
+        player_near = MemoryPlayer((8.5, 0, 0), (0, 1), (1, 0), 0.45)
+        target_loot = loot(
+            99,
+            10,
+            0,
+            rarity="Common",
+            rarity_value=0,
+            interaction_range=1.0,
+        )
+
+        def snapshot(player: MemoryPlayer, path: MemoryPath) -> MemorySnapshot:
+            return MemorySnapshot(
+                timestamp_ms=NOW_MS,
+                map_id=1,
+                instance_id=1,
+                player=player,
+                monsters=(monster(7, 5, 0),),
+                path=path,
+                loots=(target_loot,),
+                loot_scan={"ownership_filter": "all"},
+            )
+
+        snapshots = (
+            snapshot(player_far, MemoryPath(0, 0, "missing", (), "none")),
+            snapshot(
+                player_far,
+                MemoryPath(
+                    2,
+                    99,
+                    "complete",
+                    ((0, 0, 0), (5, 0, 0), (10, 0, 0)),
+                    "loot",
+                ),
+            ),
+            snapshot(player_near, MemoryPath(2, 99, "complete", (), "loot")),
+            snapshot(player_near, MemoryPath(2, 99, "complete", (), "loot")),
+        )
+        clock = iter(index * 1.0 for index in range(1000))
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            bot.win32gui,
+            "IsWindow",
+            side_effect=[True, True, True, True, False],
+        ), patch.object(
+            bot.win32api,
+            "GetAsyncKeyState",
+            return_value=0,
+        ), patch.object(
+            bot,
+            "load_memory_snapshot",
+            side_effect=snapshots,
+        ), patch.object(
+            bot,
+            "write_navigation_request",
+        ) as write_request, patch.object(
+            bot,
+            "update_held_keys",
+            side_effect=lambda hwnd, held, desired: set(desired),
+        ), patch.object(
+            bot.time,
+            "monotonic",
+            side_effect=lambda: next(clock),
+        ), patch.object(bot.time, "sleep"):
+            bot.run_bot(
+                123,
+                BotConfig(
+                    debug_window=False,
+                    pricing_enabled=False,
+                    loop_delay_ms=0,
+                    job_type=1,
+                    memory_loot_min_rarity="Common",
+                    memory_loot_confirm_frames=1,
+                    memory_loot_release_settle_ms=300,
+                    path_invalid_grace_sec=1000.0,
+                    memory_loot_chase_timeout_sec=1000.0,
+                ),
+                True,
+                mode=2,
+                request_path=Path(directory) / "request.json",
+            )
+
+        requests = [call.kwargs for call in write_request.call_args_list]
+        pickup_index = next(
+            index
+            for index, request in enumerate(requests)
+            if request.get("loot_interact", 0) > 0
+        )
+        self.assertTrue(
+            any(
+                request.get("shift_keys") == ("lshift", "rshift")
+                and request.get("movement_keys")
+                for request in requests[:pickup_index]
+            ),
+            [
+                (
+                    call.args,
+                    call.kwargs.get("movement_keys"),
+                    call.kwargs.get("shift_keys"),
+                )
+                for call in write_request.call_args_list
+            ],
+        )
+        neutral = requests[pickup_index - 1]
+        self.assertEqual(neutral.get("loot_interact", 0), 0)
+        self.assertEqual(neutral.get("movement_keys"), ())
+        self.assertEqual(neutral.get("shift_keys"), ())
+
+    def test_pickup_hysteresis_keeps_release_phase_after_small_overshoot(
+        self,
+    ) -> None:
+        target_loot = loot(
+            99,
+            10,
+            0,
+            rarity="Common",
+            rarity_value=0,
+            interaction_range=1.0,
+        )
+
+        def snapshot(player_x: float) -> MemorySnapshot:
+            return MemorySnapshot(
+                timestamp_ms=NOW_MS,
+                map_id=1,
+                instance_id=1,
+                player=MemoryPlayer(
+                    (player_x, 0, 0),
+                    (0, 1),
+                    (1, 0),
+                    0.45,
+                ),
+                monsters=(),
+                path=MemoryPath(0, 0, "missing", (), "none"),
+                loots=(target_loot,),
+                loot_scan={"ownership_filter": "all"},
+            )
+
+        # Enter at 0.75, then let the next position snapshot overshoot the
+        # configured 0.8 entry radius to 0.95.  It is still inside the loot's
+        # true 1.0 interaction radius, so the neutral-input timer must survive.
+        snapshots = (snapshot(9.25), snapshot(9.05))
+        clock = iter(index * 1.0 for index in range(1000))
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            bot.win32gui,
+            "IsWindow",
+            side_effect=[True, True, False],
+        ), patch.object(
+            bot.win32api,
+            "GetAsyncKeyState",
+            return_value=0,
+        ), patch.object(
+            bot,
+            "load_memory_snapshot",
+            side_effect=snapshots,
+        ), patch.object(
+            bot,
+            "write_navigation_request",
+        ) as write_request, patch.object(
+            bot,
+            "update_held_keys",
+            side_effect=lambda hwnd, held, desired: set(desired),
+        ), patch.object(
+            bot.time,
+            "monotonic",
+            side_effect=lambda: next(clock),
+        ), patch.object(bot.time, "sleep"):
+            bot.run_bot(
+                123,
+                BotConfig(
+                    debug_window=False,
+                    pricing_enabled=False,
+                    loop_delay_ms=0,
+                    job_type=0,
+                    memory_loot_min_rarity="Common",
+                    memory_loot_confirm_frames=1,
+                    memory_loot_range_padding_world=-0.2,
+                    memory_loot_pickup_hysteresis_world=0.25,
+                    memory_loot_release_settle_ms=300,
+                ),
+                True,
+                mode=2,
+                request_path=Path(directory) / "request.json",
+            )
+
+        pickup_requests = [
+            call.kwargs
+            for call in write_request.call_args_list
+            if call.kwargs.get("loot_interact", 0) > 0
+        ]
+        self.assertEqual(len(pickup_requests), 1)
+        self.assertEqual(pickup_requests[0]["loot_interact_object_id"], 99)
+        self.assertEqual(pickup_requests[0]["movement_keys"], ())
+        self.assertEqual(pickup_requests[0]["shift_keys"], ())
 
     def test_mode2_foreign_legendary_is_ignored_far_and_v_only_in_range(self) -> None:
         config = BotConfig(
@@ -3326,6 +3674,7 @@ class LootTests(unittest.TestCase):
             loop_delay_ms=0,
             memory_loot_min_rarity="Legendary",
             memory_loot_confirm_frames=2,
+            memory_loot_release_settle_ms=0,
         )
         player_far = MemoryPlayer((0, 0, 0), (0, 1), (1, 0), 0.45)
         # Distance 1.5 to the loot at x=10: inside the collider-independent
@@ -3718,6 +4067,42 @@ class LootTests(unittest.TestCase):
                 max_distance_world=3.0,
             ),
             0.8,
+        )
+
+    def test_pickup_hold_hysteresis_is_capped_at_server_range(self) -> None:
+        player = MemoryPlayer((0, 0, 0), (0, 1), (1, 0), 2.0)
+        target = loot(1, 1.0, 0, interaction_range=1.0)
+        self.assertAlmostEqual(
+            loot_pickup_hold_radius(
+                player,
+                target,
+                range_padding_world=-0.2,
+                hysteresis_world=0.1,
+                max_distance_world=3.0,
+            ),
+            0.9,
+        )
+        self.assertAlmostEqual(
+            loot_pickup_hold_radius(
+                player,
+                target,
+                range_padding_world=-0.2,
+                hysteresis_world=0.25,
+                max_distance_world=3.0,
+            ),
+            1.0,
+        )
+        # The hold radius never extends past the interaction range accepted by
+        # the server, even when the configured hysteresis is much larger.
+        self.assertAlmostEqual(
+            loot_pickup_hold_radius(
+                player,
+                target,
+                range_padding_world=-0.2,
+                hysteresis_world=50.0,
+                max_distance_world=3.0,
+            ),
+            1.0,
         )
 
     def test_candidate_requires_consecutive_object_id(self) -> None:

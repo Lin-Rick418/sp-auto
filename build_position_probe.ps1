@@ -167,5 +167,5 @@ if ($Install) {
     Write-Host "Installed loader: $loaderDestination"
     Write-Host "Installed on-demand probe: $probeDestination"
     Write-Host "Installed probe SHA256: $installedProbeHash"
-    Write-Host "Start SpiritVale; probe v2.22.1 loads only after Python starts."
+    Write-Host "Start SpiritVale; probe v2.23.4 loads only after Python starts."
 }
