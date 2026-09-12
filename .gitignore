@@ -26,6 +26,15 @@ spiritvale_inventory_equips.json
 spiritvale_inventory_price_report.json
 spiritvale_memory_state.json
 spiritvale_navigation_request.json
+spiritvale_probe_load_request.json
+spiritvale_probe_loader_state.json
+spiritvale_card_purchase_request.json
+spiritvale_card_purchase_result.json
+spiritvale_favorite_request.json
+spiritvale_favorite_result.json
+spiritvale_dismantle_request.json
+spiritvale_dismantle_result.json
+spiritvale_*.json.*.tmp
 
 # Dev preview screenshots
 *_preview.png

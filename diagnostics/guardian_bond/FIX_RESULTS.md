@@ -1,6 +1,6 @@
 # GuardianBond 修正（探針 2.22.1）
 
-已修改、編譯並安裝到本機 SpiritVale 的 on-demand 探針目錄。原始程式與 DLL 備份在 before_fix/。
+此為探針 2.22.1 的歷史修正紀錄，當時已修改、編譯並安裝到本機 SpiritVale 的 on-demand 探針目錄。修正前備份與原始結果 JSON 已於 2026-09-12 清理，可從 Git 提交 `84bbf07` 的本目錄取得；本頁提及的日誌為當時本機驗證紀錄。測試原始碼與重現腳本繼續保留，測試 DLL 及 runtimeconfig 由腳本重新產生。
 
 ## 已修改
 

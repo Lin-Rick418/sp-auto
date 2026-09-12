@@ -1,0 +1,9 @@
+# Generated diagnostics; keep test sources and investigation notes.
+*.asm
+*.dll
+*.runtimeconfig.json
+*_result.json
+last_state.json
+GuardianBond.skill.json
+methods.tsv
+before_fix/

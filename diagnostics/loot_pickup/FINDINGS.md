@@ -16,7 +16,7 @@
 - V 的 `Hotkey.Pickup` 是 47，由 `ApplyInputs` 的 `0xABB115` 起始分支呼叫 `PickupArea`（`0xAD16E0`），不是 ProcessSkills。
 - `SendInputsToServer` RVA `0xAEA750` 序列化同一份 `PlayerInputDto` 並送出 RPC。
 
-可用 `../guardian_bond/inspect_native.py` 重建上述反組譯；原始輸出保留在本機本資料夾的 asm 檔案。
+上述為當時本機反組譯的歷史結論。一次性擷取腳本與方法表已於 2026-09-12 從工作版本移除；需要原始調查工具時，可從 Git 提交 `84bbf07` 的 `diagnostics/guardian_bond/` 取得。原始 asm 輸出不再作為專案依賴。
 
 ## 新流程
 
@@ -48,4 +48,4 @@ Targeted loot input sent: seq=1789151404 requested=64472 interactable_id=64472 u
 
 27.06 秒內自動選取、接近、發出指定 ID 拾取並確認五件自己的 Common Flax 消失：`46718 / 30177 / 42 / 28557 / 30327`。最遠的初始導航距離為 7.35，送出時均已在 1 單位的原生互動範圍內。每個目標均以三份不同時間戳的快照確認消失，耗時約 1.25–5.30 秒；同時探針日誌核對到指定 InteractableId、Click=True、UnitId=0、Hotkeys=0。
 
-部分已消失目標在 Python 更新判定前有短暫 `missing cached loot` 重試，隨後皆正常換下一件，未見持續卡住。完整資料見 `common_full_flow_result.json`。測試結束由原本的 finally 流程停止輸入，正式設定檔逐位元組比對無變動，仍為 Legendary。原 bot 已依暫停狀態重新啟動。
+部分已消失目標在 Python 更新判定前有短暫 `missing cached loot` 重試，隨後皆正常換下一件，未見持續卡住。完整歷史資料可從 Git 提交 `84bbf07` 的 `diagnostics/loot_pickup/common_full_flow_result.json` 取得，工作版本不再保存舊測試結果。`verify_common_flow.py` 保留供重新驗證並產生新結果。當時測試結束由原本的 finally 流程停止輸入，正式設定檔逐位元組比對無變動，仍為 Legendary，原 bot 已依暫停狀態重新啟動。

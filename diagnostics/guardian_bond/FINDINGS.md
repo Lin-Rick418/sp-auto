@@ -2,6 +2,8 @@
 
 本次只調查與保存證據，未修改 bot、探針或遊戲檔，未執行實際施放。結論來自本機安裝版本的資源與 GameAssembly.dll 原生程式碼。
 
+本文描述修正前的歷史調查，修正結果見 `FIX_RESULTS.md`。2026-09-12 清理時已移除一次性資源匯出、反組譯、方法表與擷取腳本；下列原始證據檔名是歷史索引，可從 Git 提交 `84bbf07` 的 `diagnostics/guardian_bond/` 取得，不是目前執行或測試的依賴。
+
 ## 實際技能規格
 
 GuardianBond.skill.json 是 sharedassets0.assets 中 path ID 88154 的 SkillConfig，依遊戲 metadata 生成型別樹解析，完整讀取長度檢查通過。TargetType=2（AllyNotSelf）、CastType=1（Target）、CanCastGround=false、Bond=true、基礎 Range=10、基礎 CastTime=1 秒。

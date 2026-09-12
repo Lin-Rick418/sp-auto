@@ -73,7 +73,7 @@
 | `spiritvale_position_reporter.py` | 獨立位置／地圖／怪物資訊輸出 |
 | `build_position_probe.ps1`、`install_spiritvale_bot.ps1` | 探針建置與安裝 |
 | `build_release.ps1`、`run_spiritvale_bot.ps1`、`*.cmd` | 打包與啟動入口 |
-| `test_*.py`、`diagnostics/` | 單元測試、C# 行為測試與既有調查資料 |
+| `test_*.py`、`diagnostics/` | 單元測試、C# 行為測試、實機驗證腳本與調查結論；舊備份及一次性診斷產物改由 Git 歷史保留 |
 
 ## 功能邊界與閱讀注意事項
 
