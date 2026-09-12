@@ -222,6 +222,20 @@ def missing_summoner_checks(
     return missing, ""
 
 
+def summoner_checks_block_navigation(
+    config: BotConfig,
+    player: MemoryPlayer,
+    *,
+    send_input: bool,
+    active: bool,
+    follow_mode: bool,
+) -> bool:
+    """Gate movement and attacks on confirmed state, not a skill request."""
+    return summoner_checks_enabled(
+        config, player, send_input=send_input, active=active, follow_mode=follow_mode
+    ) and any(missing_summoner_checks(config, player))
+
+
 def advance_summoner_checks(
     state: SummonerCheckState,
     config: BotConfig,

@@ -162,6 +162,7 @@ from spiritvale_upkeep import (
     summon_mount_wait_status,
     reset_summoner_check_state,
     summoner_checks_enabled,
+    summoner_checks_block_navigation,
     missing_summoner_checks,
     advance_summoner_checks,
     summoner_check_wait_status,
@@ -1621,12 +1622,26 @@ def run_bot(
         cv2.namedWindow(RADAR_WINDOW_NAME, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(RADAR_WINDOW_NAME, config.radar_size_px, config.radar_size_px)
 
+    def navigation_input_allowed() -> bool:
+        # Skill maintenance may cast while navigation is blocked. Check the
+        # snapshot again at every input exit, including menu/heartbeat writes.
+        return bool(
+            send_input
+            and input_allowed
+            and (active or follow_mode)
+            and snapshot is not None
+            and not summoner_checks_block_navigation(
+                config, snapshot.player, send_input=send_input,
+                active=active, follow_mode=follow_mode,
+            )
+        )
+
     def set_keys(desired: Iterable[str]) -> None:
         nonlocal held_keys
         held_keys = update_held_keys(
             hwnd,
             held_keys,
-            desired if send_input and input_allowed else (),
+            desired if navigation_input_allowed() else (),
         )
         publish_navigation_intent(requested_target_id, requested_target_kind)
 
@@ -1636,6 +1651,8 @@ def run_bot(
         if not send_input or not input_allowed:
             return False
         if key in ATTACK_KEYS:
+            if not navigation_input_allowed():
+                return False
             tapped_attack_keys.add(key)
             publish_navigation_intent(requested_target_id, requested_target_kind)
             try:
@@ -1673,7 +1690,7 @@ def run_bot(
         # because movement (and the nav target) are intentionally cleared to 0
         # before pickup so the player stops moving.
         nonlocal pending_loot_interact, pending_loot_interact_object_id
-        if not send_input or not input_allowed:
+        if not navigation_input_allowed():
             return False
         if int(object_id) <= 0:
             return False
@@ -1711,25 +1728,28 @@ def run_bot(
         """Translate current mode/input state into one complete probe request."""
         nonlocal request_id, requested_target_kind, requested_target_id
         write_now = time.monotonic()
-        normalized_kind = "none" if object_id <= 0 else target_kind
         party_follow_active = bool(follow_discovery_active or follow_mode)
         probe_active = bool(active and not party_follow_active)
         loot_scan_active = bool(probe_active and (loot_enabled or mode == 3))
         bot_active = bool(send_input and (active or follow_mode))
+        can_navigate = navigation_input_allowed()
+        if bot_active and input_allowed and not can_navigate:
+            object_id = 0
+        normalized_kind = "none" if object_id <= 0 else target_kind
         movement_keys = tuple(
-            key for key in ("w", "a", "s", "d") if key in held_keys
+            key for key in ("w", "a", "s", "d")
+            if can_navigate and key in held_keys
         )
         attack_keys = tuple(
             key
             for key in ATTACK_KEYS
-            if key in held_keys or key in tapped_attack_keys
+            if can_navigate and (key in held_keys or key in tapped_attack_keys)
         )
         focus_target_object_id = 0
         focus_target_world = (0.0, 0.0, 0.0)
         if (
             effective_mouse_lock
-            and send_input
-            and input_allowed
+            and can_navigate
             and normalized_kind == "monster"
             and target is not None
             and target.object_id == object_id
@@ -2522,6 +2542,52 @@ def run_bot(
                     force=True,
                 )
 
+            # Selected job-type-1 summons/buffs gate every navigation mode,
+            # including pure following. Stop WASD and both Shift keys before
+            # emitting the one-shot skill IPC; navigation resumes only after a
+            # later snapshot confirms that every selected item is present.
+            check_enabled = summoner_checks_enabled(
+                config,
+                snapshot.player,
+                send_input=send_input,
+                active=active,
+                follow_mode=follow_mode,
+            )
+            check_missing, check_unavailable = missing_summoner_checks(
+                config, snapshot.player
+            )
+            if check_enabled and (check_missing or check_unavailable):
+                set_keys(())
+                # Clear the enemy focus as well as movement: a later probe
+                # update must not replace GuardianBond's target mid-cast.
+                publish_navigation_intent(0)
+            if advance_summoner_checks(
+                summoner_check_state,
+                config,
+                snapshot.player,
+                enabled=check_enabled,
+                now=now,
+                press_key=request_skill_key,
+            ):
+                pause_combat_watchdog(combat_watchdog, now)
+                chase_started_at = now
+                path_invalid_since = None
+                progress_anchor = snapshot.player.position
+                progress_started_at = now
+                unstuck_started_at = None
+                unstuck_anchor = None
+                unstuck_attempt = 0
+                status = summoner_check_wait_status(summoner_check_state)
+                announce(status, dedupe_key="summoner_check_wait")
+                if config.debug_window:
+                    cv2.imshow(
+                        RADAR_WINDOW_NAME,
+                        draw_radar(snapshot, target, (), True, status, config),
+                    )
+                    cv2.waitKey(1)
+                time.sleep(config.loop_delay_ms / 1000)
+                continue
+
             if follow_mode:
                 rebound_player = find_follow_player(
                     snapshot.players, follow_player_id
@@ -2624,52 +2690,6 @@ def run_bot(
                     )
                     cv2.waitKey(1)
                 time.sleep(max(0.05, config.target_lost_wait_ms / 1000))
-                continue
-
-            # Selected job-type-1 summons/buffs gate every navigation mode,
-            # including pure following. Stop WASD and both Shift keys before
-            # emitting the one-shot skill IPC; navigation resumes only after a
-            # later snapshot confirms that every selected item is present.
-            check_enabled = summoner_checks_enabled(
-                config,
-                snapshot.player,
-                send_input=send_input,
-                active=active,
-                follow_mode=follow_mode,
-            )
-            check_missing, check_unavailable = missing_summoner_checks(
-                config, snapshot.player
-            )
-            if check_enabled and (check_missing or check_unavailable):
-                set_keys(())
-                # Clear the enemy focus as well as movement: a later probe
-                # update must not replace GuardianBond's target mid-cast.
-                publish_navigation_intent(0)
-            if advance_summoner_checks(
-                summoner_check_state,
-                config,
-                snapshot.player,
-                enabled=check_enabled,
-                now=now,
-                press_key=request_skill_key,
-            ):
-                pause_combat_watchdog(combat_watchdog, now)
-                chase_started_at = now
-                path_invalid_since = None
-                progress_anchor = snapshot.player.position
-                progress_started_at = now
-                unstuck_started_at = None
-                unstuck_anchor = None
-                unstuck_attempt = 0
-                status = summoner_check_wait_status(summoner_check_state)
-                announce(status, dedupe_key="summoner_check_wait")
-                if config.debug_window:
-                    cv2.imshow(
-                        RADAR_WINDOW_NAME,
-                        draw_radar(snapshot, target, (), True, status, config),
-                    )
-                    cv2.waitKey(1)
-                time.sleep(config.loop_delay_ms / 1000)
                 continue
 
             # Summoner mount maintenance gates either general F8 navigation or
@@ -3580,7 +3600,7 @@ def run_bot(
                 continue
 
             mouse_moved = False
-            if effective_mouse_lock and send_input and input_allowed:
+            if effective_mouse_lock and navigation_input_allowed():
                 if target.viewport_position is None:
                     announce(
                         "一般導航怪物滑鼠鎖定需要探針 v2.16.0 的 viewport 資料。",
