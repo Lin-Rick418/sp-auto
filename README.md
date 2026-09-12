@@ -10,7 +10,9 @@
 
 整個程式不擷取或分析遊戲畫面，也不再包含紫色／綠色光柱辨識程式碼。
 
-攻擊鍵固定為 **Left Shift、Right Shift**，程式以 `ATTACK_KEYS` 表達這兩顆按鍵的用途；WASD 為移動鍵。現有各職業的攻擊長按／短按節奏保持不變。準備拾取、補召喚／Buff、暫停或死亡時，原有安全流程會釋放攻擊鍵。Python 與探針之間沿用 `shift_keys` 欄位傳輸，無須重新安裝 DLL。
+攻擊鍵固定為 **Left Shift、Right Shift**，程式以 `ATTACK_KEYS` 表達這兩顆按鍵的用途；WASD 為移動鍵。現有各職業的攻擊長按／短按節奏保持不變。準備拾取、補召喚／Buff、暫停或死亡時，安全流程會釋放攻擊鍵。Python 與探針之間沿用 `shift_keys` 欄位傳輸。
+
+**v2.23.5 需要更新 DLL**：舊探針建立空白輸入時，`ClickSkillIndex` 預設為 `0`，遊戲仍會視為第一格技能（Left Shift），即使 `shift_keys` 為空也可能出招。新版明確設為 `-1`（未點選技能），涵蓋補 Buff、等待與停止輸入。先關閉 Bot 與遊戲，再執行 `powershell -ExecutionPolicy Bypass -File .\install_spiritvale_bot.ps1 -SkipPythonSetup`，最後重開遊戲與 Bot。
 
 召喚職業的執行優先序為：**確認已啟用的 Buff／召喚物 → 補齊並等待遊戲狀態確認 → 坐騎維護 → 導航與攻擊**。啟動時先檢查；導航途中每次取得有效快照也會重新檢查。缺少項目時立即停止 WASD、左右 Shift 與敵人鎖定，逐項補放，直到全部確認存在才恢復。檢查資料不可用時同樣停止，不能把「已送出技能」當成「Buff 已生效」。純跟隨即使正在等待隊友或準備切頻，也先處理 Buff／召喚物。更新這段 Python 邏輯後須重新啟動 Bot。
 
@@ -51,7 +53,7 @@ C:\Program Files (x86)\Steam\steamapps\common\SpiritVale\BepInEx\ondemand\Spirit
 .\build_release.ps1
 ```
 
-ZIP 會輸出至 `dist\SpiritValeBot-v2.23.4-win64.zip`，包含 Loader、按需探針、可攜式 LocalAppData IPC、一鍵安裝、Python 虛擬環境設定與啟動腳本，不包含測試、原始 C#、執行期 JSON、個人裝備篩選規則或本機報告。
+ZIP 會輸出至 `dist\SpiritValeBot-v2.23.5-win64.zip`，包含 Loader、按需探針、可攜式 LocalAppData IPC、一鍵安裝、Python 虛擬環境設定與啟動腳本，不包含測試、原始 C#、執行期 JSON、個人裝備篩選規則或本機報告。
 
 ## 執行
 

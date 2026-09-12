@@ -18,8 +18,12 @@ public class Unit {
     public int ObjectId { get; set; } public Network NetworkObject { get; set; }
     public Vec Position { get; set; } public Skills Skills { get; set; }
     public object SkillReady { get; set; }
+    public object enemy { get; set; }
     public Dto Inputs { get; set; } public Dto currentInputs { get; set; }
     public Dto Sent; public int Applied, Targeted, SentCount;
+    public int ClickedSkill = -1, SkillClicks;
+    public void ProcessMovement(Dto dto) { }
+    public void ClickSkill(int index) { ClickedSkill=index; SkillClicks++; }
     public void ApplyInputs(Dto dto) {
         if (!dto.Click || dto.InteractableId != 99 || dto.UnitId != 0 || dto.Hotkeys != 0)
             throw new Exception("Wrong local click DTO");
@@ -71,12 +75,12 @@ public static class Tests {
             foreach (string name in new [] { "Move", "ClickPosition", "FastCastPosition", "Hotkeys", "HotkeysHeld",
                 "UnitId", "LootId", "InteractableId", "Click", "AltClick", "FastCast", "SkillHold", "ClickSkillIndex" })
                 Prop(bg, "_"+char.ToLowerInvariant(name[0])+name.Substring(1), typeof(Dto), name);
-            foreach (string name in new [] { "Inputs", "currentInputs", "SkillReady", "ObjectId" })
+            foreach (string name in new [] { "Inputs", "currentInputs", "SkillReady", "ObjectId", "enemy" })
                 Prop(bg, "_"+char.ToLowerInvariant(name[0])+name.Substring(1), typeof(Unit), name);
             Prop(bg, "_appPlayer", typeof(App), "Player");
             Set(bg, "_inputDtoType", typeof(Dto)); Set(bg, "_moveType", typeof(Vec));
             foreach (string axis in new [] { "X", "Y", "Z" }) Set(bg, "_move"+axis+"Field", typeof(Vec).GetField(axis.ToLowerInvariant()));
-            foreach (string name in new [] { "ApplyInputs", "ProcessTargeting", "SendInputsToServer" })
+            foreach (string name in new [] { "ApplyInputs", "ProcessTargeting", "SendInputsToServer", "ProcessMovement", "ClickSkill" })
                 Set(bg, "_"+char.ToLowerInvariant(name[0])+name.Substring(1), typeof(Unit).GetMethod(name));
             Type log=Assembly.LoadFrom(Path.Combine(args[1], "BepInEx.Core.dll")).GetType("BepInEx.Logging.ManualLogSource");
             Set(bg, "_log", Activator.CreateInstance(log, new object[] { "PickupTests" }));
@@ -149,6 +153,51 @@ public static class Tests {
             Req("LootScanActive",false); Req("LootInteract",7); Call(bg,"UpdatePostfix",player);
             Req("LootScanActive",true); Call(bg,"UpdatePostfix",player);
             Check(player.Applied==1, "F7-off pickup not replayed on enable");
+            // Buff maintenance starts with BotActive=true and no Shift intent.
+            // Native ProcessSkills treats ClickSkillIndex=0 as Skill1_1 even
+            // when both hotkey masks are empty. Neutral input must use -1.
+            Req("LootScanActive",false); Req("BackgroundInputMode","send_process");
+            Req("BackgroundSkillMode","capture"); Req("ShiftKeys","");
+            Set(bg,"_wasSending",false);
+            int before=player.SentCount;
+            Call(bg,"UpdatePostfix",player);
+            Check(player.SentCount==before+1 && player.Sent.ClickSkillIndex==-1
+                && player.Sent.Hotkeys==0 && player.Sent.HotkeysHeld==0,
+                "startup upkeep heartbeat cannot select Left Shift skill zero");
+            IDictionary numpad=(IDictionary)bg.GetField("NumpadHotkeys",All).GetValue(null);
+            numpad["numpad5"]=new System.Collections.Generic.List<int> { 24 };
+            Req("SkillKeyRequestId",1L); Req("SkillKey","numpad5");
+            Call(bg,"UpdatePostfix",player);
+            Check(player.ClickedSkill==24 && player.SkillClicks==1
+                && player.Sent.ClickSkillIndex==-1 && player.Sent.Hotkeys==0,
+                "summon request queues NumPad skill without an implicit attack RPC");
+            Call(bg,"UpdatePostfix",player);
+            Check(player.SkillClicks==1 && player.Sent.ClickSkillIndex==-1,
+                "waiting for buff confirmation neither repeats skill nor attacks");
+            Req("BotActive",false); Call(bg,"UpdatePostfix",player);
+            Check(player.Sent.ClickSkillIndex==-1 && player.Sent.Hotkeys==0,
+                "stop RPC also uses the no-skill sentinel");
+            Req("BotActive",true); Req("BackgroundSkillMode","process");
+            Req("BackgroundInputMode","send"); Req("ShiftKeys","lshift,rshift");
+            ((IList)bg.GetField("LeftShiftHotkeys",All).GetValue(null)).Add(0);
+            ((IList)bg.GetField("RightShiftHotkeys",All).GetValue(null)).Add(1);
+            Call(bg,"UpdatePostfix",player);
+            Check(player.Sent.Hotkeys==3UL && player.Sent.HotkeysHeld==3UL
+                && player.Sent.ClickSkillIndex==-1,
+                "explicit attacks still use only the requested Shift hotkeys");
+            Req("ShiftKeys",""); Call(bg,"UpdatePostfix",player);
+            Check(player.Sent.Hotkeys==0 && player.Sent.HotkeysHeld==0
+                && player.Sent.ClickSkillIndex==-1,
+                "releasing attacks cannot reselect skill zero");
+            Req("BackgroundInputMode","capture");
+            player.Inputs=new Dto { ClickSkillIndex=0 };
+            Call(bg,"Postfix",player,false);
+            Check(player.Inputs.ClickSkillIndex==-1 && player.Inputs.Hotkeys==0,
+                "capture fallback without game input also uses no-skill sentinel");
+            player.Inputs=new Dto { ClickSkillIndex=24 };
+            Call(bg,"Postfix",player,true);
+            Check(player.Inputs.ClickSkillIndex==24,
+                "real captured NumPad buff click survives input overlay");
             Console.WriteLine(checks+" pickup behavior checks passed"); return 0;
         } catch(Exception error) { Console.Error.WriteLine(error); return 1; }
     }

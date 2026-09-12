@@ -1,4 +1,6 @@
-# SpiritVale Bot v2.23.4 快速開始
+# SpiritVale Bot v2.23.5 快速開始
+
+v2.23.5 修正補 Buff 前誤觸第一格技能（Left Shift）：探針的空白輸入現在明確使用「未點選技能」狀態。此次需關閉 Bot 與遊戲後更新 DLL，再重新啟動；只重開 Python 不會更新已載入的探針。
 
 ## 使用條件
 

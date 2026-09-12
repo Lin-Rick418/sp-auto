@@ -15,7 +15,7 @@ using HarmonyLib;
 
 namespace SpiritValePositionProbe
 {
-    [BepInPlugin("local.spiritvale.positionprobe", "SpiritVale Position Probe", "2.23.4")]
+    [BepInPlugin("local.spiritvale.positionprobe", "SpiritVale Position Probe", "2.23.5")]
     public sealed class Plugin : BasePlugin
     {
         internal const int SchemaVersion = 1;
@@ -240,7 +240,7 @@ namespace SpiritValePositionProbe
             }
 
             Log.LogInfo(
-                "Memory navigation probe v2.23.4 loaded on demand; auto_relogin="
+                "Memory navigation probe v2.23.5 loaded on demand; auto_relogin="
                 + (autoReloginEnabled ? "enabled" : "disabled")
                 + "; run_in_background="
                 + (runInBackgroundEnabled ? "enabled" : "unavailable")
@@ -926,7 +926,7 @@ namespace SpiritValePositionProbe
                     ? _inputs.GetValue(__instance, null)
                     : null;
                 if (inputs == null)
-                    inputs = Activator.CreateInstance(_inputDtoType);
+                    inputs = CreateNeutralInputs();
                 _move.SetValue(
                     inputs,
                     CreateMoveVector(horizontal, vertical, depth),
@@ -1038,7 +1038,7 @@ namespace SpiritValePositionProbe
                 float x = authorized ? _request.MovementWorldX : 0f;
                 float y = authorized ? _request.MovementWorldY : 0f;
                 float z = authorized ? _request.MovementWorldZ : 0f;
-                object inputs = Activator.CreateInstance(_inputDtoType);
+                object inputs = CreateNeutralInputs();
                 _move.SetValue(inputs, CreateMoveVector(x, y, z), null);
                 string requestedShiftKeys = authorized
                     ? _request.ShiftKeys
@@ -1678,6 +1678,17 @@ namespace SpiritValePositionProbe
                     + "(" + values[index] + ")";
             }
             return string.Join(",", names);
+        }
+
+        private static object CreateNeutralInputs()
+        {
+            object inputs = Activator.CreateInstance(_inputDtoType);
+            // Zero is a real skill slot (normally Left Shift), not "no click".
+            // ProcessSkills checks this index independently of Hotkeys/Held.
+            // Only initialize newly allocated DTOs: a DTO captured by the game
+            // may carry the NumPad buff queued by ClickSkill on the last frame.
+            _clickSkillIndex.SetValue(inputs, -1, null);
+            return inputs;
         }
 
         private static void ApplyShiftHotkeys(
